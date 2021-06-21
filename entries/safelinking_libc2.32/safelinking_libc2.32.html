@@ -1,0 +1,289 @@
+<p>
+<script src="https://cdn.rawgit.com/google/code-prettify/master/loader/run_prettify.js?skin=desert"></script>
+</p>
+<style><!--
+li.L0, li.L1, li.L2, li.L3,
+li.L5, li.L6, li.L7, li.L8 {
+    list-style-type: decimal !important;
+}
+    li.L1,
+    li.L3,
+    li.L5,
+    li.L7,
+    li.L9 { background: #303030 }
+--></style>
+<p> </p>
+<p> </p>
+<p>[:contents]</p>
+<p> </p>
+<p> </p>
+<p> </p>
+<h3>0: 参考</h3>
+<p>【A】Safe-Linking設計者ブログ</p>
+<p><iframe class="embed-card embed-webcard" style="display: block; width: 100%; height: 155px; max-width: 500px; margin: 10px 0px;" title="Safe-Linking - Eliminating a 20 year-old malloc() exploit primitive - Check Point Research" src="https://hatenablog-parts.com/embed?url=https%3A%2F%2Fresearch.checkpoint.com%2F2020%2Fsafe-linking-eliminating-a-20-year-old-malloc-exploit-primitive%2F" frameborder="0" scrolling="no"></iframe><cite class="hatena-citation"><a href="https://research.checkpoint.com/2020/safe-linking-eliminating-a-20-year-old-malloc-exploit-primitive/">research.checkpoint.com</a></cite></p>
+<p> </p>
+<p>【B】Safe-Linking Bypass の提案</p>
+<p><a href="https://www.researchinnovations.com/post/bypassing-the-upcoming-safe-linking-mitigation">https://www.researchinnovations.com/post/bypassing-the-upcoming-safe-linking-mitigation</a></p>
+<p> </p>
+<p>【C】House of Io の提案</p>
+<p><a href="href">House of Io</a><cite class="hatena-citation"><a href="https://awaraucom.wordpress.com/2020/07/13/house-of-io/">awaraucom.wordpress.com</a></cite></p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<h3>1: イントロ</h3>
+<p>こんにちは、ニートです。<br /><br /> この夏もまた、glibcの新しいバージョン(2.32)のリリース日が近づいてきました。</p>
+<p>今回のアップデートでは、malloc/freeに <strong>Safe Linking</strong> というものが追加されます(多分。知らんけど)。かつて2005年のglibc2.3.6において実装された <strong>Safe-Unlinking</strong> を彷彿とさせる忌々しい名前ですね。本エントリでは、この Safe Linking を概観してみようと思います。それと同時に、Safe-Linkingのbypass方法についても概観し、ほんの少しだけ触れてみようと思います。<br /><br /><br /><br /></p>
+<p>尚、この先触れる内容は実は前々から実装されていたかもしれませんが、自分が気づいた時其れ即ち実装された時ということで、悪しからず。<br /><br /></p>
+<p> </p>
+<h3>2: Safe-Linking 概観</h3>
+<p><strong>Safe-Linking</strong>は、2020年8月1日リリースの<strong>Glibc 2.32</strong>においてリリースが予定され既にmasterブランチに乗っている、heap exploitationに対するmitigationのことである</p>
+<p>設計者によると、以下の3つの攻撃に対して防衛的役割を果たすとされている</p>
+<blockquote>
+<p> Our solution protects against 3 common attacks regularly used in modern day exploits:<br /><strong>Partial pointer override</strong>: Modifying the lower bytes of the pointer (Little Endian).<br /><strong>Full pointer override</strong>: Hijacking the pointer to a chosen arbitrary location.<br /><strong>Unaligned chunks</strong>: Pointing the list to an unaligned address. </p>
+</blockquote>
+<blockquote>
+<p>( 参考【A】)</p>
+</blockquote>
+<p> </p>
+<p> </p>
+<p>まずは、実際に Safe-Linking が実装されているglibcでバイナリを動かしたときのheapの様子を見てみることにする</p>
+<p>以下のソースコードを glibc 2.32 用にビルドした</p>
+<p> </p>
+<pre class="prettyprint linenums">#include&lt;stdio.h&gt;<stdio.h>
+#include&lt;stdlib.h&gt;<stdlib.h>
+#include&lt;string.h&gt;<string.h>
+
+int main(void)
+{
+  char *a = malloc(0x20);
+  char *b = malloc(0x20);
+  char *c = malloc(0x20);
+  char *d = malloc(0x20);
+
+  free(a);
+  free(b);
+  free(c);
+
+  return 0;
+}</string.h></stdlib.h></stdio.h></pre>
+<p> </p>
+<p>これをfreeの直前まで動かした後のheapが以下のようになる。</p>
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20200718/20200718000006.png" alt="f:id:smallkirby:20200718000006p:plain" title="f:id:smallkirby:20200718000006p:plain" class="hatena-fotolife" itemprop="image" /></p>
+<p><br /><br /></p>
+<p> </p>
+<p>chunk A,B,C の順にmalloc()されており、A,B,Cのbkはkey ( &gt; libc 2.29) であるから &amp;tcache が入っているのは言するに値しないだろう</p>
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20200718/20200718000140.png" alt="f:id:smallkirby:20200718000140p:plain" title="f:id:smallkirby:20200718000140p:plain" class="hatena-fotolife" itemprop="image" /></p>
+<p> </p>
+<p>それはいいとして、注目すべきはABCのfdである</p>
+<p><span style="text-decoration: underline;"><strong>heap addrのように見えるけど、なんかよくわからん値</strong></span>が入っていることが見て取れる</p>
+<p> </p>
+<p>これのおかげで、binコマンドによってtcacheのリストを見ようとすると以下のようになる<img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20200718/20200718000408.png" alt="f:id:smallkirby:20200718000408p:plain" title="f:id:smallkirby:20200718000408p:plain" class="hatena-fotolife" itemprop="image" /></p>
+<p>pwndbgが2.32に対応していないため、linked listが崩壊していることが分かる</p>
+<p> </p>
+<p> </p>
+<p>また、CのfdのLSBを0x00に書き換えてtcache dupを行おうとすると以下のようになる</p>
+<p> </p>
+<pre class="prettyprint linenums">pwndbg&gt; set {char}0x555555559300 = 0x00
+pwndbg&gt; c </pre>
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20200718/20200718001132.png" alt="f:id:smallkirby:20200718001132p:plain" title="f:id:smallkirby:20200718001132p:plain" class="hatena-fotolife" itemprop="image" /></p>
+<p> </p>
+<p><em>malloc(): unaligned tcache chunk detected</em> というエラーが出てabortしていることが分かる</p>
+<p> </p>
+<p>これにより、少なくとも従来のUAFによるLSB書き換えでのtcache dupはSafe-Linkingによって失敗するということがわかるであろう(後述するが、厳密には「失敗する」よりも「失敗する確率が上がる」の方が正しい)</p>
+<p>以下で、その実装を見ていくことにする</p>
+<p> </p>
+<p> </p>
+<h3>3: Safe-Linkingの実装とその仕組み</h3>
+<h5>実装</h5>
+<p>まずは<strong> tcache_put()</strong> の実装を以下に示す。</p>
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20200718/20200718003213.png" alt="f:id:smallkirby:20200718003213p:plain" title="f:id:smallkirby:20200718003213p:plain" class="hatena-fotolife" itemprop="image" /></p>
+<p>( 左の行数はオレンジ表示が絶対行数、その他が相対行数を表している)</p>
+<p> </p>
+<p>+12行目において <strong>PROTECT_PTR</strong> というマクロに <span style="text-decoration: underline;">free されたchunkのアドレス</span>と<span style="text-decoration: underline;">tcacheに繋がっている最初のbinのアドレス</span>が渡され、その結果がnextに入っていることが分かる</p>
+<p> </p>
+<p><strong>PROTECT_PTR</strong>は以下のように定義される</p>
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20200718/20200718003353.png" alt="f:id:smallkirby:20200718003353p:plain" title="f:id:smallkirby:20200718003353p:plain" class="hatena-fotolife" itemprop="image" /></p>
+<p>見ての通り、<span style="text-decoration: underline;"><strong>freeしたchunkのアドレスを12bit右シフトした値と 従来のnextに入るアドレス のxorを返している</strong></span></p>
+<p><strong>REVEAL_PTR</strong>マクロは後ほど出てくるが、xorをするという性質上PROTECT_PTRを使いまわしている</p>
+<p> </p>
+<p> </p>
+<p>深い話は後にして、_int_malloc()/ _int_free() を眺める</p>
+<p> 以下に _int_free() の実装の一部を示す。</p>
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20200718/20200718002822.png" alt="f:id:smallkirby:20200718002822p:plain" title="f:id:smallkirby:20200718002822p:plain" class="hatena-fotolife" itemprop="image" /> 変更点は、<em>e-&gt;key==tcache </em>だった場合の全探索においてリストを辿る際の for ループにおいて <strong>REVEAL_PTR</strong> を使っていることくらいである</p>
+<p>これは、PROTECT_PTR によって加工した値からもとのアドレスを取り出す操作である</p>
+<p> </p>
+<p> _int_malloc() の変更点はこんな感じ</p>
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20200718/20200718011339.png" alt="f:id:smallkirby:20200718011339p:plain" title="f:id:smallkirby:20200718011339p:plain" class="hatena-fotolife" itemprop="image" /></p>
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20200718/20200718011425.png" alt="f:id:smallkirby:20200718011425p:plain" title="f:id:smallkirby:20200718011425p:plain" class="hatena-fotolife" itemprop="image" /></p>
+<p> </p>
+<p>fastbin関係においても tcache と同様に REVEAL_PTR が使用されていることが分かる</p>
+<p> </p>
+<p>但し今回はtcacheについて見たいため、<strong>tcache_get()</strong> の実装を以下に示す</p>
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20200718/20200718013022.png" alt="f:id:smallkirby:20200718013022p:plain" title="f:id:smallkirby:20200718013022p:plain" class="hatena-fotolife" itemprop="image" /></p>
+<p><br /><br /></p>
+<p><strong>aligned_OK(e)</strong> というマクロを呼び、チェックに失敗すると先程まさに現れたエラーメッセージが表示されるようになっている</p>
+<p>それでは aligned_OK は(名前から推測こそできるものの)何をしているかというと以下のようになっている</p>
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20200718/20200718013244.png" alt="f:id:smallkirby:20200718013244p:plain" title="f:id:smallkirby:20200718013244p:plain" class="hatena-fotolife" itemprop="image" /></p>
+<p> </p>
+<p>単純に与えられたポインタと <strong>MALLOC_ALIGN_MASK</strong>(==15)の論理積がゼロかを判断している。これは、与えられたアドレス p が 0x10 align されているかどうかを判断しているに他ならない</p>
+<p> </p>
+<p> </p>
+<p>さてここまでで大凡の仕組みは推測できるだろうが、以下で設計者の言葉(参考【A】)も借りながら仕組みを総まとめする</p>
+<p> </p>
+<p> </p>
+<h5>仕組み</h5>
+<p><span style="text-decoration: underline;"><strong>Safe-Linking</strong> は 単方向リストのポインタを加工することで、先にあげたようなポインタの書き換えによる攻撃を回避</span>しようとする</p>
+<p>この加工は、_int_free() 時に PROTECT_PTR マクロによって行われる</p>
+<p>このマクロがそのchunkのアドレスと本来next(fd)に書き込むはずの値の xor を生成することは、先に見たとおりである</p>
+<p> </p>
+<p>先程の例を再掲する</p>
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20200718/20200718014033.png" alt="f:id:smallkirby:20200718014033p:plain" title="f:id:smallkirby:20200718014033p:plain" class="hatena-fotolife" itemprop="image" /></p>
+<p>上から順に <em>chunk A,B,C,D</em> とし、 ABCはこの順に free されてtcacheに入っている</p>
+<p> </p>
+<p>例えばAまでfreeし、次にBをfreeする際のことを考えてみる</p>
+<p>このとき、従来ならば <em>B(0x5555555592d0)</em> のfdにはAのアドレスである <em>0x5555555592a0</em> が入るはずである</p>
+<p>しかし今回の修正により、 <em>PROTECT_PTR(0x5555555592d0, 0x5555555592a0)</em> が呼ばれることになった</p>
+<p>この内部では、<em>((((size_t) pos) &gt;&gt; 12) ^ ((size_t) ptr)))</em> という式すなわち <em>0x5555555592d0&gt;&gt;12  ^ 0x5555555592a0</em> によって、<em>0x55500000c7f9</em>という値が生成される</p>
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20200718/20200718014601.png" alt="f:id:smallkirby:20200718014601p:plain" title="f:id:smallkirby:20200718014601p:plain" class="hatena-fotolife" itemprop="image" /></p>
+<p>これはまさしく B の next に入っている値と同一である</p>
+<p> </p>
+<p>それでは tcache のリンクを参照する際、すなわち tcache に複数のchunkが繋がった状態で malloc() を呼び、tcache に対して 次のchunkのアドレスを書き込みたいという場合にはどうしているのだろうか</p>
+<p>つい先程見たように、Cをmalloc()で取り出した後 B の next には PROTECT_PTR によって加工された値が入っているため、tcacheに直接書き込むわけには行かない (そうしてしまうと、最早もとのアドレスを復元することは不可能になってしまう、復号に必要なのは加工された値とそのアドレスの2点なのだから)</p>
+<p>そこで、tcache_get() で見たように REVEAL_PTR マクロによってもとのnextの値を復元している</p>
+<p>PROTECT_PTRでは所詮2つの値を xor していただけだったから、復号もxorを行うだけで可能である (そして実際に REVEAL_PTR の内部では PROTECT_PTR を呼んでいる)</p>
+<p>そのようにして復元した値をtcacheに書き込むのである</p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p>ここで最も重要なのは、<span style="text-decoration: underline;">「攻撃者は『攻撃の初期の段階においては』heapのアドレスを知らない」という事実</span>である</p>
+<p>これは、言わずもがなASLR有効の場合にはアドレス空間は下位3nibbleを除いてランダマイズされるからである</p>
+<p>先程 PROTECT_PTR で わざわざ chunk のアドレスを 12bit 分シフトさせていたのは、固定値の3nibbleではなくランダマイズされたアドレス部を用いるためであった</p>
+<p>この事実と、「もとのnextを復元するためには加工をした結果の値とそのchunkのheap上の値が必要である」という2つの事実を組み合わせることで、「攻撃者は初期の段階でもとのnextの値を知ることができない」という結論が導かれる</p>
+<p> </p>
+<p> </p>
+<p>それでは、nextのもとの値のを知ることができないという事実を用いて如何にしてlinear overflowを検知するのかというと、ここで登場するのが先程の aligned_OK マクロである</p>
+<p>このマクロは REVEALED_PTRによって復元したnextの値が0x10 aligneされているかどうかを確認する</p>
+<p>よって、linear overflow等でnextを書き換える際に、下1nibble分を適切に書き換えてやらないと、この aligned_OK マクロで殺されることになる</p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p>.</p>
+<p>..</p>
+<p>... </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p>そう、おそらく気づいたと思うが</p>
+<p>この mitigation は 15/16の確率でしか攻撃を検知できない</p>
+<p>overwriteした1nibbleがたまたま正確な値だった場合、エラーを検知できず書き換えられた値をもとにして REVEAL_PTR されたアドレスを next として認識してしまうことになるのだ</p>
+<p>これが本エントリの冒頭でexploitを防ぐものではなく、失敗する確率を上げるものであると言った理由である</p>
+<p>設計者の言葉を借りるなら、<em>raise the bar</em> らしい</p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p>というわけで、Safe-Linkingの実装と仕組みを概観してきた</p>
+<p>上では tcache について見てきたが、この実装は一般の単方向リストに適用できるものであり、<span style="text-decoration: underline;">fastbin にも Safe-Linkingが適用されている</span></p>
+<p>単純なtcache dup、とりわけよく知られた 0x7F テク等はこれで難しくなる</p>
+<p> </p>
+<p>尚、この実装はASLRの生成する3nibble分のエントロピを利用したものであり、新たに実装されたコードは非常に少なくオーバーヘッドが小さい</p>
+<p>参考【1】よりベンチマーク試験の結果を以下に示す</p>
+<figure class="figure-image figure-image-fotolife mceNonEditable" title="https://research.checkpoint.com/2020/safe-linking-eliminating-a-20-year-old-malloc-exploit-primitive/">
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20200718/20200718021203.png" alt="f:id:smallkirby:20200718021203p:plain" title="f:id:smallkirby:20200718021203p:plain" class="hatena-fotolife" itemprop="image" /></p>
+<figcaption class="mceEditable">https://research.checkpoint.com/2020/safe-linking-eliminating-a-20-year-old-malloc-exploit-primitive/</figcaption>
+</figure>
+<p> </p>
+<p>左が従来のmallocの実装、右がSafe-Linkingを実装したものであるが、その殆どで差異がないことがわかる</p>
+<p>寧ろSafe-Linkingを実装したもののほうが高速に動作している項目も多いが、これは環境誤差であると考えられる。すなわち誤差が大きく影響するほどにはSafe-Linking実装によるオーバーヘッドは小さいということが見て取れる</p>
+<p> </p>
+<p> </p>
+<p> </p>
+<h4>4. House of io</h4>
+<p>Safe-LinkingのBypassについて、まずは House of io について触れておく</p>
+<p>なんか突然Twitterで記事が流れてきた為読んでみた。詳しくは  参考【C】を参照</p>
+<p>Safe-Linkingでは next/fd を不正に書き換えたまま2回 malloc() を行うとエラーが出るのは上に見たとおりである。そこで、この bypass 方法では tcache の key をleakした上で、tcacheに直接書き換えたいアドレスを書き込んでいる。tcacheに書き込まれるアドレス自体は PROTECT_PTR されていないため、もしこれができれば tcache_dupすることができる。</p>
+<p>但し、事前に key の leak が必要なことに加えて、何よりAAWできないといけないことが、現実/CTFの問題においてはかなり厳しく、そもそもAAWが可能であるならばもっと他に色々とできそうな気がしていて、有効な手法なのかどうかは今の段階では疑わしい気がしている。</p>
+<p>ということで、この手法について触れるのはここまでとする。</p>
+<p> </p>
+<p> </p>
+<h4>5. P' から Lの leak</h4>
+<p>以下に、PROTECT_PTR の仕組みの外観図を参考【A】より拝借して提示する。</p>
+<figure class="figure-image figure-image-fotolife mceNonEditable" title="https://research.checkpoint.com/2020/safe-linking-eliminating-a-20-year-old-malloc-exploit-primitive/">
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20200719/20200719190036.png" alt="f:id:smallkirby:20200719190036p:plain" title="f:id:smallkirby:20200719190036p:plain" class="hatena-fotolife" itemprop="image" /></p>
+<figcaption class="mceEditable">https://research.checkpoint.com/2020/safe-linking-eliminating-a-20-year-old-malloc-exploit-primitive/</figcaption>
+</figure>
+<p>ここで P は tcache の next に書き込まれるはずの本来のアドレス、L は PROTECT_PTR で加工に利用する chunk 自体のアドレス、P' は LとPから PROTECT_PTR によって生成される値である</p>
+<p>ここで、free したあとの tcache にたいして 8byte のみ read が可能であるという状況を想定し、「P'からLを復元したい」とする。以下に先程の例を再掲する。</p>
+<p> </p>
+<figure class="figure-image figure-image-fotolife mceNonEditable" title="example">
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20200719/20200719190558.png" alt="f:id:smallkirby:20200719190558p:plain" title="f:id:smallkirby:20200719190558p:plain" class="hatena-fotolife" itemprop="image" /></p>
+<figcaption class="mceEditable">example</figcaption>
+</figure>
+<p>まず、全てのchunkに対してUAF(read)が可能であるならば、Lの値は単にtcacheの先端のchunkのnextを読むだけである。上の例においては A を最初に free しているため tcache の先頭に繋がっているが、AのnextにはLがそのまま格納されていることが見て取れる。</p>
+<p>次に、BのP'のみがreadできたとする。このとき、Lはheapのアドレスを12bitシフトしているため、Pと比較して上位3nibbleが全て0になっている。すなわち、P'の上位3nibbleはそのままLの値であることがわかる。更に、Pの続く2nibbleは今leakしたLの上位2nibbleとxorしているため、これも直ちに計算によって求めることができる。この作業を繰り返すことによって、Pのみの情報からLをleakすることが可能である。Lをleakすることができたということは(狭い文脈においては) heap のアドレスを完全に掌握できたことになるため、あとは通常通りのoverwriteを PROTECT_PTR と同じ計算を施してから行えば tcache dup が可能ということになる。(勿論 key は適宜書き換える必要があるが、これは1byteでも書き換えれば可能である。)</p>
+<p> </p>
+<p>このように、対象chunkが同一ページ内に配置され、且つその中でのオフセットが既知/操作でき、8(or6)byteのleakが可能な場合においては、従来と全く変わらずに tcache dup が可能になる。(但し全くreadができない状況において next の下1byteだけを書き換えて循環tcacheを作るといったことは難しい)<br /> </p>
+<p>上の画像でBの<em>P'=0x000055500000C7F9</em>のみから <em>L=0x555555559 </em>が復元できることを以下のスクリプトで確かめられる。</p>
+<pre class="prettyprint linenums">Pd = int(raw_input("P': "),16)
+L = Pd &gt;&gt; 36
+for i in range(3):
+  temp = (Pd &gt;&gt; (36-(i+1)*8)) &amp; 0xff
+  element = ((L&gt;&gt;4) ^ temp) &amp; 0xff
+  L = (L&lt;&lt;8) + element
+print("L : "+hex(L))
+</pre>
+<p> </p>
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20200719/20200719194641.png" alt="f:id:smallkirby:20200719194641p:plain" title="f:id:smallkirby:20200719194641p:plain" class="hatena-fotolife" itemprop="image" /></p>
+<p><br /><br /></p>
+<p> </p>
+<p> </p>
+<h4>6. Further Attack</h4>
+<p> 参考【B】に、1byteのoverflowで P' をleakし L を計算して、任意の値を再び加工してoverwriteするPoCが置いてある</p>
+<p>やっていることは、普通に consolidation を使って overlapping chunk を作り、生じたUAFで P' をleakするだけなので、特に目新しいことはしていないようである</p>
+<p>House of io でもそうだったが、今のところは P' を leak することで通常通り overwrite をするという方法が一般的らしい</p>
+<p> </p>
+<p> </p>
+<h4>7. アウトロ</h4>
+<p>設計者は36C3 CTFをやっている最中にコレを思いついたらしいです</p>
+<p>俺がOnetimePadをなんとか殺している間に、設計者はpwnerを殺そうとしていたのか...</p>
+<p>今回潰された/難しくされた脆弱性もそうですが、Intel CETが秋に出るとかどうとかという噂もあって、なんやかんや長い間放置されてきた脆弱性が消えていくのは、悲しいね<br />因みにこの話をTSG slackでしたところ、物理こそ最強であり、爆破こそ至高という結論に至りました</p>
+<p>怖い人たちですね、僕は違いますが。</p>
+<p><br />まぁ結局はどんどん新しいexploitが見つけられ、過去のexploit達は忘れられていくのでしょう</p>
+<p>pwner達は血も涙もない薄情糞野郎ばかりですから</p>
+<p> </p>
+<p> </p>
+<p> 続く...</p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p><span style="font-size: 80%; color: #cccccc;">(三浦春馬さんのご冥福を心よりお祈りします) </span></p>
+<p> </p>
+<p> </p>

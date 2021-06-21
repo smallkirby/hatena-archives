@@ -1,0 +1,171 @@
+
+<p><script src="https://cdn.rawgit.com/google/code-prettify/master/loader/run_prettify.js?skin=desert"></script></p>
+ <!-- KEYWORDS HERE -->
+<div class="contents">[:contents]</div>
+<p> </p>
+<p> </p>
+<p> <strong>注意: 本記事に書いてあることを実際に試して環境がぶっ壊れてもなんの責任も負いませんし、サンダルで散歩した時に親指を怪我したとしてもなんの責任も取りません。</strong></p>
+<p></p>
+<p></p>
+<p></p>
+<p>大学院の募集が始まり研究計画書が書けないということでイライラすることはよくあると思います。</p>
+<p></p>
+<p>イライラしたときに、aptのデバッグをするためにソースからビルドして、それを間違えて環境にインストールしてしまうこともよくあると思います。</p>
+<p>そうすると、おそらく以下のように<code>/etc/apt</code>ではなく<code>/usr/local/etc/apt</code>を見に行くようになってしまい、余計イライラが蓄積していきます。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">.sh</div>
+<pre class="prettyprint linenums lang-sh">
+W: Unable to read /usr/local/etc/apt/apt.conf.d/ - DirectoryExists (2: No such file or directory)
+W: Unable to read /usr/local/etc/apt/sources.list.d/ - DirectoryExists (2: No such file or directory)
+W: Unable to read /usr/local/etc/apt/sources.list - RealFileExists (2: No such file or directory)
+W: Unable to read /usr/local/etc/apt/preferences.d/ - DirectoryExists (2: No such file or directory)
+</pre>
+<p></p>
+<p>apt自体は異常な量のconfig名前空間を持っており、それを指定することで一時的にetcディレクトリを指定することはできます。例えば<code>sudo apt -oDir::Etc=/etc/apt install hoge</code>とすることでetcを指定することができます。それにしたってinstall時に以下のようなエラーが出ます。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">.sh</div>
+<pre class="prettyprint linenums lang-sh">
+After this operation, 120 MB of additional disk space will be used.
+Do you want to continue? [Y/n] Y
+E: Cannot get debconf version. Is debconf installed?
+debconf: apt-extracttemplates failed: No such file or directory
+Extracting templates from packages: 30%E: Cannot get debconf version. Is debconf installed?
+debconf: apt-extracttemplates failed: No such file or directory
+Extracting templates from packages: 61%E: Cannot get debconf version. Is debconf installed?
+debconf: apt-extracttemplates failed: No such file or directory
+Extracting templates from packages: 91%E: Cannot get debconf version. Is debconf installed?
+debconf: apt-extracttemplates failed: No such file or directory
+Extracting templates from packages: 100%
+Could not exec dpkg!
+E: Sub-process /usr/local/bin/dpkg returned an error code (100)
+</pre>
+<p></p>
+<p>ここまで来ると、およそ大抵の人はイライラが蓄積し、aptをリインストールすることになると思います。しかし、aptだけリインストールしても上の症状は全く変わりません。</p>
+<p>そうするとほとんどの人はそのイライラから以下のようなコマンドを打つことになると思います。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">.sh</div>
+<pre class="prettyprint linenums lang-sh">
+wataru@skbpc:~: 20:43:34 Thu Jun 03
+$ sudo rm /usr/bin/dpkg
+wataru@skbpc:~: 20:43:50 Thu Jun 03
+$ sudo rm /usr/bin/apt
+</pre>
+<p></p>
+<p>ここで、1分くらい絶望に暮れましょう。</p>
+<p></p>
+<p></p>
+<h4>dpkgのリインストール</h4>
+<p>多分、UbuntuのISOイメージに入ってるaptとdpkgを使ってやるのが最もクリーンだと思いますが、以下ではちょっとdirtyかもしれない方法を使います。ISO入ったCD-ROMって、なくしがちだもんね。</p>
+<p>やることは、aptがやってくれることを手動でやるだけです。</p>
+<p>まずはIndexファイルを取ってきます。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">.sh</div>
+<pre class="prettyprint linenums lang-sh">
+$ wget http://security.ubuntu.com/ubuntu/dists/focal/main/binary-adm64/Packages.gz
+--2021-06-03 21:39:20--  http://security.ubuntu.com/ubuntu/dists/focal/main/binary-adm64/Packages.gz
+Resolving security.ubuntu.com (security.ubuntu.com)... 2001:67c:1562::15, 2001:67c:1562::18, 91.189.91.39, ...
+Connecting to security.ubuntu.com (security.ubuntu.com)|2001:67c:1562::15|:80... connected.
+HTTP request sent, awaiting response... 404 Not Found
+2021-06-03 21:39:21 ERROR 404: Not Found.
+
+$ wget http://security.ubuntu.com/ubuntu/dists/focal/main/binary-amd64/Packages.gz
+--2021-06-03 21:39:34--  http://security.ubuntu.com/ubuntu/dists/focal/main/binary-amd64/Packages.gz
+Resolving security.ubuntu.com (security.ubuntu.com)... 2001:67c:1562::15, 2001:67c:1562::18, 91.189.91.39, ...
+Connecting to security.ubuntu.com (security.ubuntu.com)|2001:67c:1562::15|:80... connected.
+HTTP request sent, awaiting response... 200 OK
+Length: 1274738 (1.2M) [application/x-gzip]
+Saving to: ‘Packages.gz’
+
+Packages.gz            100%[==========================&gt;]   1.21M   916KB/s    in 1.4s
+
+2021-06-03 21:39:36 (916 KB/s) - ‘Packages.gz’ saved [1274738/1274738]
+
+$ gunzip ./Packages.gz
+</pre>
+<p>ここで一回<code>binary-amd64</code>を<code>binary-adm64</code>とtypoすることが重要です。distroとarchとcomponentは自分が使っているものに合わせてください。そしたら、そのIndexファイルを見てdpkgを探します。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">.sh</div>
+<pre class="prettyprint linenums lang-sh">
+Package: dpkg
+Architecture: amd64
+Version: 1.19.7ubuntu3
+Multi-Arch: foreign
+Priority: required
+Essential: yes
+Section: admin
+Origin: Ubuntu
+Maintainer: Ubuntu Developers &lt;ubuntu-devel-discuss@lists.ubuntu.com&gt;
+Original-Maintainer: Dpkg Developers &lt;debian-dpkg@lists.debian.org&gt;
+Bugs: https://bugs.launchpad.net/ubuntu/+filebug
+Installed-Size: 6740
+Pre-Depends: libbz2-1.0, libc6 (&gt;= 2.15), liblzma5 (&gt;= 5.2.2), libselinux1 (&gt;= 2.3), libzstd1 (&gt;= 1.3.2), zlib1g (&gt;= 1:1.1.4)
+Depends: tar (&gt;= 1.28-1)
+Suggests: apt, debsig-verify
+Breaks: acidbase (&lt;= 1.4.5-4), amule (&lt;&lt; 2.3.1+git1a369e47-3), beep (&lt;&lt; 1.3-4), im (&lt;&lt; 1:151-4), libapt-pkg5.0 (&lt;&lt; 1.7~b), libdpkg-perl (&lt;&lt; 1.18.11), lsb-base (&lt;&lt; 10.2019031300), netselect (&lt;&lt; 0.3.ds1-27), pconsole (&lt;&lt; 1.0-12), phpgacl (&lt;&lt; 3.3.7-7.3), pure-ftpd (&lt;&lt; 1.0.43-1), systemtap (&lt;&lt; 2.8-1), terminatorx (&lt;&lt; 4.0.1-1), xvt (&lt;= 2.1-20.1)
+Filename: pool/main/d/dpkg/dpkg_1.19.7ubuntu3_amd64.deb
+Size: 1127856
+MD5sum: f595c79475d3c2ac808eaac389071c35
+SHA1: b9cb6b292865ec85bca1021085bc0e81e160e676
+SHA256: 76132be95c7199f902767fb329e0f33210ac5b5b1816746543bc75f795d9a37c
+Homepage: https://wiki.debian.org/Teams/Dpkg
+Description: Debian package management system
+Task: minimal
+Description-md5: 2f156c6a30cc39895ad3487111e8c190
+</pre>
+<p><code>Filename</code>を見ると、バイナリの場所が書いてあるのでそれを取ってきます。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">.sh</div>
+<pre class="prettyprint linenums lang-sh">
+$ wget http://security.ubuntu.com/ubuntu/pool/main/d/dpkg/dpkg_1.19.7ubuntu3_amd64.deb
+</pre>
+<p></p>
+<p>dpkgがないため、バイナリなくてやばいなり、という渾身のギャグを一発かました後、直接extractしてバイナリを取り出します。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">.sh</div>
+<pre class="prettyprint linenums lang-sh">
+mkdir nirugiri &amp;&amp; cd nirugiri
+ar x ../dpkg_1.19.7ubuntu3_amd64.deb
+unxz ./data.tar.xz &amp;&amp; tar xvf ./data.tar
+sudo cp ./usr/bin/dpkg /usr/bin/
+</pre>
+<p></p>
+<p>これでdpkgのリインストールは終わり。</p>
+<p></p>
+<h4>aptのリインストール</h4>
+<p>apt自体は、上の方法で同様にやればOK。しかも今回はdpkgを使えます。ありがて〜〜〜。</p>
+<p>aptのインストールが終わったら念の為dpkgをaptからリインストールするといいって実家を出る時にばあちゃんが言ってました。</p>
+<p></p>
+<h4>古いaptを消す</h4>
+<p>これでやっと振り出しに戻りますが、以前aptは<code>/usr/local/etc/apt</code>を見続けます。ストーカー並みに見続けます。</p>
+<p>なので、straceして何が悪さをしているかを見ます。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">.sh</div>
+<pre class="prettyprint linenums lang-sh">
+openat(AT_FDCWD, &quot;/usr/local/lib/libapt-private.so.0.0&quot;, O_RDONLY|O_CLOEXEC) = 3
+</pre>
+<p>この辺ですね。抹消します。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">.sh</div>
+<pre class="prettyprint linenums lang-sh">
+sudo mv /usr/local/lib/libapt-private.so.0.0 /usr/local/lib/libapt-private.so.0.0.kasu
+sudo mv /usr/local/lib/libapt-pkg.so /usr/local/lib/libapt-pkg.so.kasu
+</pre>
+<p>恨みを込めて、拡張子はkasuにしておくのがおすすめです。</p>
+<p></p>
+<p></p>
+<h3>アウトロ</h3>
+<p>いかがだったでしょうか？</p>
+<p></p>
+<p></p>
+<p>晩御飯はいつ食べても美味しいことが知られています。</p>
+<p></p>
+<p></p>
+<p></p>
+<h3>参考</h3>
+<p>1: ニルギリ</p>
+<p><a href='https://youtu.be/yvUvamhYPHw'>https://youtu.be/yvUvamhYPHw</a></p>
+
+<p></p><p></p>
+<p></p><p></p>
+<p>続く...</p>
+<p></p><p></p>
