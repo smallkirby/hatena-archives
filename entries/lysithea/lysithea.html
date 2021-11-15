@@ -1,0 +1,183 @@
+<p>
+<script src="https://cdn.rawgit.com/google/code-prettify/master/loader/run_prettify.js?skin=desert"></script>
+</p>
+<!-- KEYWORDS HERE -->
+<div class="keywords"><span class="btitle">Warning</span>
+<p>this article is not about pwn.</p>
+</div>
+<div class="contents">[:contents]</div>
+<p> </p>
+<p> </p>
+<p> </p>
+<h3>1: イントロ</h3>
+<p> </p>
+<p>最近、本当に朝が起きられずに困っています。理由を考えたところ、冬だから朝の日光の量が少ないという結論に至りました。僕は悪くありません。</p>
+<p> </p>
+<p> </p>
+<h3>2: 突如襲ってくるBashスクリプト書きたい欲</h3>
+<p> </p>
+<p><strong><em>「なんかBashスクリプトを書きてぇ」</em></strong></p>
+<p>きっと皆さんも半年に一回くらい思うことがあるでしょう。僕も思いました。特にBashの構文が好きとかではないし、寧ろBash全然分からん民なのですが、知らないからこそ半年に一回くらいちゃんとしたスクリプトを書きたくなります。</p>
+<p>Bashの一番いいところは、結局半年後には構文含めて全部忘れることです。好きな小説を、もう一度読む前の新鮮な気持ちで読み直したいというのは、人類誰もが思ったことがあるでしょう。僕もノルウェイの森は18歳に戻って何度でも読み直したい衝動に駆られます。でもそれはできません。既に何回も読んでしまったし、なによりもう20歳を超えてしまっています。ノルウェイの森は、18歳で読むべき本であり、今読み返しても当時以上の気持ちを抱くことは出来ないでしょう。対して、Bashは何度でも忘れて何度でも新鮮な気持ちで書くことの出来る唯一の言語です。書こうと思う度に、新しいBashに出会えます。</p>
+<p>さて、問題は何を書くかです。普段からちょっとしたワンライナーくらいなら書くことはあるけど、今回はそれなりに規模のあるものを書きたい。ということで、以下に続きます。</p>
+<p> </p>
+<p> </p>
+<h3>3: リシテアのお話</h3>
+<p> </p>
+<p>最近、あまりCTFのkernel問題を解いていません。この前久しぶりにBsidesなんちゃらCTFの<code>shared knote</code>という問題をやったけどぼろぼろぼろでした。特にひどかったのが、必ずクラッシュしてレース成功しねぇ〜〜〜〜と8億年くらい嘆いていたら、exploit中でレース後に処理を止めずにそのままexitしていたため、不正なfdをそのまま全部閉じていてそのせいで落ちていただけというのがありました。それに気づくまでかなりの時間を消耗したので、とてもぽよぽよになりました。</p>
+<p>その問題では<code>/proc/sys/vm/mmap_min_addr</code>が0になっているというところに気付けるかどうかが大きかったのですが、これは僕の"kernel問で最初にやることリスト"に入っていなかったため見逃してました。そもそもにリストに入っていたとしても、リストの中身を全部チェックするのは結構面倒くさいため多分気づいていなかったと思います。</p>
+<p>ということで、今回はココらへんの自動化を目的としてBashスクリプトを書くことにしました。わーい、わーい。題材見つかったよ〜〜。</p>
+<p> </p>
+<p>書いたやつはGithubに置いときました。まだ工事中だけど。</p>
+<p><iframe src="https://hatenablog-parts.com/embed?url=https%3A%2F%2Fgithub.com%2Fsmallkirby%2Flysithea" title="GitHub - smallkirby/lysithea: small snippet manager for kernel challenges" class="embed-card embed-webcard" scrolling="no" frameborder="0" style="display: block; width: 100%; height: 155px; max-width: 500px; margin: 10px 0px;"></iframe><cite class="hatena-citation"><a href="https://github.com/smallkirby/lysithea">github.com</a></cite></p>
+<p> </p>
+<h4>試行錯誤の自動ログ</h4>
+<p>kernelpwnしてる時って、exploit書いてはQEMU立ち上げて走らせて出力見て泣いて、またexploit書き直して...の繰り返しです。問題は途中で方針転換したりした時で、まぁ大抵うまく行きません。取り敢えず一旦うまくいったところまで戻って書き直そうとしたときにはもう遅い、どこまでがうまくいってたやつか分からなくなっています。戻しては実行し、戻しては実行し、最終的には乾パンを買いに行ったっきり二度と問題を解かなくなること間違いなしです。</p>
+<p>どうしたらいいか、答えは簡単。QEMUを動かす度にexploitのスナップショットを取れば良いんです。但しexploitだけではどの時点までうまく行っていたか分かりません。QEMUの出力も一緒に保存してしまいましょう。</p>
+<p>git使えばいいだけですね。実行する度にcommitするのはめんどいですね。スクリプトの出番ですね。</p>
+<figure class="figure-image figure-image-fotolife mceNonEditable" title="lysithea local">
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20211115/20211115180107.png" alt="f:id:smallkirby:20211115180107p:plain" width="690" height="489" loading="lazy" title="" class="hatena-fotolife" itemprop="image" /></p>
+<figcaption class="mceEditable">lysithea local</figcaption>
+</figure>
+<p>戻りたいときは、一旦log一覧を確認して。</p>
+<figure class="figure-image figure-image-fotolife mceNonEditable" title="lysithea logs">
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20211115/20211115180128.png" alt="f:id:smallkirby:20211115180128p:plain" width="393" height="274" loading="lazy" title="" class="hatena-fotolife" itemprop="image" /></p>
+<figcaption class="mceEditable">lysithea logs</figcaption>
+</figure>
+<p>これだと思うものを指定すれば、そのときのQEMU出力が見れます。これで、どこまでうまく行ってたのか分かりやすいね！わ〜〜い、わ〜〜〜い。</p>
+<figure class="figure-image figure-image-fotolife mceNonEditable" title="lysithea log 0">
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20211115/20211115180142.png" alt="f:id:smallkirby:20211115180142p:plain" width="676" height="379" loading="lazy" title="" class="hatena-fotolife" itemprop="image" /></p>
+<figcaption class="mceEditable">lysithea log 0</figcaption>
+</figure>
+<p>当時のexploitも簡単に確認できないとね。これで方針転換しほうだいだ！やった〜〜〜、やった〜〜〜〜。</p>
+<figure class="figure-image figure-image-fotolife mceNonEditable" title="lysithea fetch">
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20211115/20211115180201.png" alt="f:id:smallkirby:20211115180201p:plain" width="398" height="381" loading="lazy" title="" class="hatena-fotolife" itemprop="image" /></p>
+<figcaption class="mceEditable">lysithea fetch</figcaption>
+</figure>
+<h4>コンフィグチェッカー</h4>
+<p><iframe src="https://hatenablog-parts.com/embed?url=https%3A%2F%2Fgithub.com%2Fsmallkirby%2Flysithea%2Ftree%2Fmaster%2Fdrothea" title="lysithea/drothea at master · smallkirby/lysithea" class="embed-card embed-webcard" scrolling="no" frameborder="0" style="display: block; width: 100%; height: 155px; max-width: 500px; margin: 10px 0px;"></iframe><cite class="hatena-citation"><a href="https://github.com/smallkirby/lysithea/tree/master/drothea">github.com</a></cite></p>
+<p> </p>
+<p>さてさて、先程話にも出た、確認すべきkernelのコンフィグの話。これも、まとめてしまいましょう。これは大体<code>/proc</code>以下のファイルをcatするだけなので適当にBash書いときゃOKですね。但しbusyboxのシェルは<code>ash</code>なので、Bash-specificな機能なしのPOSIX準拠で書かなくちゃね。あと、<code>userfaultfd</code>が存在しているかどうかとかはCプログラム中で確認しなきゃなので、純Bashで確認できないところはCにおまかせしています。</p>
+<p> </p>
+<p>但し、これを実行するのに手間がかかるとめんどくさくて、結局確認しないまま問題を解き始めて崩壊するのが目に見えていますね。そして解けなくて乾パン買いに行くのも目に見えています。人間の怠惰をなめてはいけません。これも自動化しましょう。</p>
+<figure class="figure-image figure-image-fotolife mceNonEditable" title="lysithea drothea">
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20211115/20211115180247.png" alt="f:id:smallkirby:20211115180247p:plain" width="424" height="363" loading="lazy" title="" class="hatena-fotolife" itemprop="image" /></p>
+<figcaption class="mceEditable">lysithea drothea</figcaption>
+</figure>
+<p>やった〜〜〜。これで問題を解き始める前に1コマンドをホストで叩くだけでチェックリストを確認できますね。テスト群自体はまだ殆どモックしか無いけど、まぁそれはこれからやります(やらない未来が見えているけどね)。</p>
+<p> </p>
+<h4>あとはスニペットをちょちょいと混ぜて</h4>
+<p>今までは、ファイルシステム展開したり圧縮したりexploitをビルドしたりするスニペットを別で管理していましたが、これも混ぜ混ぜしました。名前覚えるのめんどいしね。これでワークスペースのセットアップも1コマンドで済むね、わ〜〜〜〜いわ〜〜〜〜〜い。乾パンを買いに行ける時間が増えて嬉しいです。</p>
+<figure class="figure-image figure-image-fotolife mceNonEditable" title="lysithea init">
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20211115/20211115180316.png" alt="f:id:smallkirby:20211115180316p:plain" width="753" height="792" loading="lazy" title="" class="hatena-fotolife" itemprop="image" /></p>
+<figcaption class="mceEditable">lysithea init</figcaption>
+</figure>
+<p> </p>
+<h4>飽きた</h4>
+<p>ここまで書いてBashに飽きたので、もう一生書きません。Pythonが試行だってカーニハンとリッチーが言ってました。</p>
+<p> </p>
+<p> </p>
+<p> </p>
+<h3>4: わんちゃんワンちゃん飼いたい</h3>
+<p> </p>
+<p>理念と目標を一切持たないことで知られる僕ですが、人生に対してただ一つだけ目標を持っています。</p>
+<p> </p>
+<p><strong><em>犬を、飼いたい。</em></strong></p>
+<p> </p>
+<p>これだけが、僕の人生の唯一の目標です。今すぐにでも、飼いたい。そして、愛でたい。散歩したい。</p>
+<p>僕の実家は犬を室内飼いするのに反対な家族がいたため、犬を飼うことは出来ませんでした。外で飼うのは、僕の信念に反します。家族だから一緒の部屋で過ごしたい。よって飼うのをずっと我慢してきました。</p>
+<p>さて、大学生になり一人暮らしになりましたが。じゃあ今すぐ犬と過ごせるかと言うと、否です。問題は金銭面ではありません。それはまぁなんとかすればなんとかなるでしょう。</p>
+<p>問題は、大学生は研究室によく行くので家を空ける時間が多いということ。犬は人間なので、ずっと一人だと寂しくなってしまいます。不規則に且つ長時間家を空けることが多い現在は、飼うことはできません。できないというか、まぁできるはできるだろうけど、僕の犬信念に反します。</p>
+<p> </p>
+<p> </p>
+<p>なので今は犬の画像を眺めることで我慢しましょう。以下、僕の好きな犬リストです。永久保存版です。</p>
+<p> </p>
+<p> </p>
+<h4>柴犬</h4>
+<figure class="figure-image figure-image-fotolife mceNonEditable" title="Thorsten Schulze&lt;/a&gt;による&lt;a href=&quot;https://pixabay.com/ja/?utm_source=link-attribution&amp;amp;utm_medium=referral&amp;amp;utm_campaign=image&amp;amp;utm_content=6292660&quot;&gt;Pixabay&lt;/a&gt;からの画像">
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20211115/20211115180433.jpg" alt="f:id:smallkirby:20211115180433j:plain" width="640" height="427" loading="lazy" title="" class="hatena-fotolife" itemprop="image" /></p>
+<figcaption class="mceEditable">Thorsten Schulzeによる<a href="https://pixabay.com/ja/?utm_source=link-attribution&amp;utm_medium=referral&amp;utm_campaign=image&amp;utm_content=6292660">Pixabay</a>からの画像</figcaption>
+</figure>
+<p>一番好き、すごく好き。地元にいる時に、近所で柴犬を飼っている人がいたので頻繁に訪れて散歩させてもらっていました。あの素朴な可愛さは何よりもたまりません。小さすぎないのも可愛いです。ぼくは小さすぎる生物(チワワとか)を虫と同じレイヤーで認識してしまいがちなので、柴犬のサイズはぼくのストライクゾーンど真ん中です。あのしっぽをマフラーにしたいです。</p>
+<p> </p>
+<h4>シベリアンハスキー</h4>
+<figure class="figure-image figure-image-fotolife mceNonEditable" title="a">
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20211115/20211115180618.jpg" alt="f:id:smallkirby:20211115180618j:plain" width="640" height="425" loading="lazy" title="" class="hatena-fotolife" itemprop="image" /></p>
+<figcaption class="mceEditable"><a href="https://pixabay.com/ja/users/barbara808-2692110/?utm_source=link-attribution&amp;utm_medium=referral&amp;utm_campaign=image&amp;utm_content=4735878">BARBARA808</a>による<a href="https://pixabay.com/ja/?utm_source=link-attribution&amp;utm_medium=referral&amp;utm_campaign=image&amp;utm_content=4735878">Pixabay</a>からの画像</figcaption>
+</figure>
+<p>狼っぽいのが好き。ハスキーを好きになったのは大学生になってからなんですが、あの大きさで体を擦り寄せてきた時には、そのまま持って帰ってしまおうかと思いましたね。</p>
+<p> </p>
+<h4>スピッツ(日本スピッツ)</h4>
+<figure class="figure-image figure-image-fotolife mceNonEditable" title="a">
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20211115/20211115180632.jpg" alt="f:id:smallkirby:20211115180632j:plain" width="640" height="426" loading="lazy" title="" class="hatena-fotolife" itemprop="image" /></p>
+<figcaption class="mceEditable"><a href="https://pixabay.com/ja/users/spiritze-3079232/?utm_source=link-attribution&amp;utm_medium=referral&amp;utm_campaign=image&amp;utm_content=2088431">Spiritze</a>による<a href="https://pixabay.com/ja/?utm_source=link-attribution&amp;utm_medium=referral&amp;utm_campaign=image&amp;utm_content=2088431">Pixabay</a>からの画像</figcaption>
+</figure>
+<p><br /><br /></p>
+<p>やや小さめの犬種の中で唯一のランクイン。スピッツは、僕が猛烈に犬を飼いたかった小学生時代に、犬種図鑑みたいなのを眺めていた中で一目惚れした犬種です。尚、一回も実物を触ったことはありません。顔が好きです。</p>
+<p> </p>
+<h4>秋田犬</h4>
+<figure class="figure-image figure-image-fotolife mceNonEditable" title="a">
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20211115/20211115180649.jpg" alt="f:id:smallkirby:20211115180649j:plain" width="640" height="427" loading="lazy" title="" class="hatena-fotolife" itemprop="image" /></p>
+<figcaption class="mceEditable"><a href="https://pixabay.com/ja/users/maxxxiss-19205165/?utm_source=link-attribution&amp;utm_medium=referral&amp;utm_campaign=image&amp;utm_content=5763408">maxxxiss</a>による<a href="https://pixabay.com/ja/?utm_source=link-attribution&amp;utm_medium=referral&amp;utm_campaign=image&amp;utm_content=5763408">Pixabay</a>からの画像</figcaption>
+</figure>
+<p>やっぱり日本の犬こそ至高。もふもふなので最早わたあめ。わたあめに埋もれたいという良くはないけど、秋田犬に埋もれたい気持ちは人類の三大欲求の内の2つを占める。</p>
+<p> </p>
+<h4>たぬき</h4>
+<figure class="figure-image figure-image-fotolife mceNonEditable" title="a">
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20211115/20211115180706.jpg" alt="f:id:smallkirby:20211115180706j:plain" width="640" height="427" loading="lazy" title="" class="hatena-fotolife" itemprop="image" /></p>
+<figcaption class="mceEditable"><a href="https://pixabay.com/ja/users/andreiprodan_-19125858/?utm_source=link-attribution&amp;utm_medium=referral&amp;utm_campaign=image&amp;utm_content=5791402">Andrei Prodan</a>による<a href="https://pixabay.com/ja/?utm_source=link-attribution&amp;utm_medium=referral&amp;utm_campaign=image&amp;utm_content=5791402">Pixabay</a>からの画像</figcaption>
+</figure>
+<p> </p>
+<p>犬以外から、堂々のランクイン。実家にたまに出現していたんですが、なんとも愛くるしい姿をしています。まるまる太ったたぬきは、もはやたぬきを超えてキツネと言っても過言ではないでしょう。</p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<h4>乾パン</h4>
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20211115/20211115180719.jpg" alt="f:id:smallkirby:20211115180719j:plain" width="1200" height="900" loading="lazy" title="" class="hatena-fotolife" itemprop="image" /></p>
+<p>非生物から、堂々のランクイン。僕も2年ほど前まではこいつを犬とは思っていなかったけれども、素朴な佇まい・愛くるしいフォルム・媚び具合、どれをとっても柴犬のそれと同じ。相違点を見つけることができなかかったため、犬として判断、ランク入り。</p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<h3>5: Youtube Shorts</h3>
+<p> </p>
+<p>さてさて、自分に肩書きをつけるとしたら、最初は大学4年生になるでしょう。それでは他に何か肩書きをつけるとしたら、それは間違いなく"Youtube Shortsアンチ代表"になります。</p>
+<p>僕はYoutubeで犬の動画(そして泣く泣く猫の動画)を見ることが好きなのですが、そのYoutubeに最近Shortsという機能が実装されました。これはほぼTiktokで、神聖なるYoutubeには到底許される機能ではありません。</p>
+<p>まず、シーケンスバーが無い。意味がわからない。時間戻しが出来ない。どうなってんねん。ダブルタップが勝手にLikeになる。自分のLikedVideosにshortsが気づかずに入っていた日には、その日はずっと嫌な気分のままです。それから、次の動画がわからない。これが一番最悪。shortsには、犬の動画が多くあります。スワイプする度に可愛い犬が出てくるため、コレ自体はまぁいいです。但し、次の動画が予測できない(学習されてるっぽいけど)ため、見たくもない動画が目に入ることが多いです。一番最悪だったのは、犬の動画を見ていてスワイプしたら、Gの動画だったときです。あの日から僕はYoutubeShortsアンチ世界代表になりました。</p>
+<p>そして、最近はshortsが存在するYoutubeが嫌になったためスマホからYoutubeを消しました。さようなら。shortsが消えたら、また会おう。</p>
+<p> </p>
+<p> </p>
+<p> </p>
+<h3>6: ファイアーエムブレム</h3>
+<p> </p>
+<p>最近ちょっとした時間にゲームをするためにファイアーエムブレム風花雪月を買いました。いわゆるマスゲーとかSRPGとかいわれる種類のゲームです。院試期間中にこの上なくciv6にどハマリしたので、何らかのシミュレーションゲームを探していたところ、スマブラにも出てくるからという理由で風花雪月を買いました。</p>
+<p>結果、とても好きです。ルールをよく知らないうちは、劣化版シミュレーションゲームじゃんとか思っていたけど、ちゃんと各ステータスの意味を調べている内に、ちゃんと考えてプレイできるゲームなんだと認識しました。純シミュレーションと異なり、キャラの育成要素もあるのが特長です。強いて言えば、僕は育成ゲームでは徹底的に育成しまくって、周回しまくって、ラスボスをこてんぱんに蹂躙するのが好きなのですが、本ゲームでは行動回数が制限されていたり、周回時にキャラを引き継げなかったりと育成に制限が有るため、その部分だけが少し不満です。あとキャラごとに支援値に制限が有るのも、少し不満。</p>
+<p>既に1周して今2周目なのですが、今回はゲームを始める前にどのキャラをどう育てるかをまとめてから始めたので、1周目とは比較にならないぐらいつよつよなパーティが出来ています。空、飛び放題です。</p>
+<p> </p>
+<p>先程のBashスクリプトで出てきたlysitheaとかdrotheaとかは風花雪月のキャラから取りました、意味はないけどね。リシテア、めちゃめちゃ強いです。火力がやばい。射程2の魔法しか覚えないのはあれだけど、杖持たせればいいだけです。ボスも大抵こいつでワンパンです。強い。</p>
+<p> </p>
+<p> </p>
+<p> </p>
+<h3>7: アウトロ</h3>
+<p> </p>
+<p><strong><em>いかがだったでしょうか???</em></strong></p>
+<p> </p>
+<p>カス記事を書くのはいつだって楽しいことが知られています。</p>
+<p> </p>
+<p> </p>
+<h3>8: 参考</h3>
+<p>1: lysithea</p>
+<p><a href="https://github.com/smallkirby/lysithea">https://github.com/smallkirby/lysithea</a></p>
+<p>2: ニルギリ</p>
+<p><a href="https://youtu.be/yvUvamhYPHw">https://youtu.be/yvUvamhYPHw</a></p>
+<p><a> </a></p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p>続く...</p>
+<p> </p>
+<p> </p>
