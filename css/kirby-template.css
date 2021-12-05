@@ -32,23 +32,6 @@ html {
 }
 
 
-/* colors */
-
-
-/*  ebdbb2: normal */
-
-
-/*  c45e5e: impact */
-
-
-/*  32302F: background */
-
-
-/*  86A886: border */
-
-
-/*  f3b82f: title */
-
 
 /* Sections
    ========================================================================== */
@@ -56,9 +39,6 @@ html {
 
 /** Pretty Print **/
 
-
-/*
-*/
 
 pre.prettyprint {
     margin-top: 0;
@@ -585,18 +565,20 @@ template {
 
 html,
 body {
-    font-family: "Inconsolata", monospace;
+    font-family: "Ubuntu Mono", monospace;
     color: #ebdbb2;
     background-color: #32302f;
     line-height: 1.6;
 }
 
 a {
-    color: #83b221;
+    color: #689d6a;
+    margin-left: 6px;
+    margin-top: 6px;
 }
 
 a:hover {
-    color: #0f668f;
+    color: #427b58;
 }
 
 a.keyword {
@@ -608,10 +590,12 @@ a.keyword {
 .entry-content code {
     background-color: #404040;
     color: #c57e80;
-    font-family: "Menlo", monospace;
+    font-family: "Ubuntu Mono", monospace;
     padding-top: 0.2em;
     padding: 0;
     margin: 0;
+    margin-left: 6px;
+    margin-right: 6px;
     border-radius: 3px;
     font-size: 85%;
 }
@@ -646,9 +630,10 @@ h6 a:hover {
 }
 
 strong {
-    color: #c45e5e;
+    color: #ebdbb2;
     background-color: #32302f;
     font-family: "Ubuntu Mono", monospace;
+    font-weight: bold;
 }
 
 a {
@@ -771,7 +756,7 @@ li.L9 {
 }
 
 #box2 {
-    width: 20%;
+    width: 80%;
     margin-right: 10px;
 }
 
@@ -885,13 +870,13 @@ li.L9 {
 }
 
 .entry-title-link {
-    color: #f3b82f;
+    color: #ebdbb2;
 }
 
 @media (min-width: 992px) {
     .entry-title {
         font-size: 1.6rem;
-        color: #f3b82f;
+        color: #ebdbb2;
     }
 }
 
@@ -1393,7 +1378,7 @@ li.L9 {
     position: relative;
     margin: 2em 0;
     padding: 0.5em 1em;
-    border: solid 3px #86a886;
+    border: solid 3px #cbcba2;
     border-radius: 8px;
 }
 
@@ -1405,7 +1390,7 @@ li.L9 {
     padding: 0 9px;
     line-height: 1;
     font-size: 19px;
-    color: #c45e5e;
+    color: #fbebc2;
     background-color: #32302f;
     font-weight: bold;
 }
@@ -1413,7 +1398,7 @@ li.L9 {
 .keywords p {
     margin: 0;
     padding: 0;
-    color: #f3b82f;
+    color: #ebdbb2;
 }
 
 
