@@ -1,7 +1,7 @@
 @charset "UTF-8";
 
 /*
-  Theme: fucking-this-summer
+  Theme: poyopoyo-summer
   Author: smallkirby
   Description:
     This summer, too hot.
@@ -29,6 +29,10 @@ html {
     /* 2 */
     -webkit-text-size-adjust: 100%;
     /* 2 */
+}
+
+#globalheader {
+    background-color: rgba(19,15,26);
 }
 
 
@@ -110,6 +114,14 @@ figure,
 main {
     /* 1 */
     display: block;
+}
+
+#main {
+    padding: 0 3rem;
+    border-left: 2px solid;
+    border-right: 2px solid;
+    border-color: rgba(55,65,81);
+    border-radius: 0.75rem;
 }
 
 
@@ -567,7 +579,7 @@ html,
 body {
     font-family: "Ubuntu Mono", monospace;
     color: #ebdbb2;
-    background-color: #32302f;
+    background-color: rgba(19,15,26);
     line-height: 1.6;
 }
 
@@ -590,13 +602,13 @@ a.keyword {
 .entry-content code {
     background-color: #404040;
     color: #c57e80;
-    font-family: "Ubuntu Mono", monospace;
-    padding-top: 0.2em;
-    padding: 0;
+    font-family: "monospace";
+    font-size: 85%;
+    padding: 0.2em 0.4em;
     margin: 0;
     margin-left: 6px;
     margin-right: 6px;
-    border-radius: 3px;
+    border-radius: 6px;
     font-size: 85%;
 }
 
@@ -771,7 +783,7 @@ li.L9 {
 #title a {
     position: relative;
     margin: 0 auto;
-    font-size: 2.2rem;
+    font-size: 2.5rem;
     font-family: "Ubuntu Mono", monospace;
     font-style: italic;
     color: #c45e5e;
@@ -870,18 +882,22 @@ li.L9 {
 }
 
 .entry-title-link {
-    color: #ebdbb2;
+    color: #b8bb26;
+    font-size: 1.9rem;
+    margin-left: 0;
+    padding-left: 0;
 }
 
 @media (min-width: 992px) {
     .entry-title {
         font-size: 1.6rem;
-        color: #ebdbb2;
+        color: #af3a03;
     }
 }
 
 .categories {
     margin: 0.5em 0;
+    padding-left: 1.0rem;
     font-size: 0.9rem;
 }
 
@@ -1023,7 +1039,6 @@ li.L9 {
 }
 
 .entry-content pre {
-    background: #f5f5f5;
     border: none;
     white-space: pre-wrap;
     text-overflow: ellipsis;
@@ -1378,7 +1393,7 @@ li.L9 {
     position: relative;
     margin: 2em 0;
     padding: 0.5em 1em;
-    border: solid 3px #cbcba2;
+    border: solid 3px rgba(55,65,81);
     border-radius: 8px;
 }
 
@@ -1391,14 +1406,16 @@ li.L9 {
     line-height: 1;
     font-size: 19px;
     color: #fbebc2;
-    background-color: #32302f;
+    background-color: rgba(19,15,26);
     font-weight: bold;
 }
 
 .keywords p {
     margin: 0;
-    padding: 0;
+    padding-top: 2px;
+    padding-left: 7px;
     color: #ebdbb2;
+    font-family: "monospace";
 }
 
 
