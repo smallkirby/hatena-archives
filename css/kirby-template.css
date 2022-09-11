@@ -118,10 +118,14 @@ main {
 
 #main {
     padding: 0 3rem;
-    border-left: 2px solid;
-    border-right: 2px solid;
-    border-color: rgba(55,65,81);
-    border-radius: 0.75rem;
+}
+@media (min-width: 992px) {
+    #main {
+        border-left: 2px solid;
+        border-right: 2px solid;
+        border-color: rgba(55,65,81);
+        border-radius: 0.75rem;
+    }
 }
 
 
@@ -581,6 +585,12 @@ body {
     color: #ebdbb2;
     background-color: rgba(19,15,26);
     line-height: 1.6;
+    font-size: 26px;
+}
+@media (min-width: 992px) {
+    html,body {
+        font-size: 16px;
+    }
 }
 
 a {
@@ -733,12 +743,19 @@ li.L9 {
 
 #container,
 #footer {
-    padding-left: 10px;
-    padding-right: 10px;
-    width: 90%;
+    padding: 0;
+    width: 100%;
     margin: auto;
 }
-
+@media (min-width: 992px) {
+    #container,
+    #footer {
+        padding-left: 10px;
+        padding-right: 10px;
+        width: 90%;
+        margin: auto;
+    }
+}
 
 /* 2カラムレイアウト */
 
@@ -755,21 +772,39 @@ li.L9 {
     justify-content: space-between;
 }
 
-#content-inner {
-    -webkit-box-orient: horizontal;
-    -webkit-box-direction: normal;
-    -ms-flex-direction: row;
-    flex-direction: row;
+@media (min-width: 992px) {
+    #content-inner {
+        -webkit-box-orient: horizontal;
+        -webkit-box-direction: normal;
+        -ms-flex-direction: row;
+        flex-direction: row;
+    }
 }
 
+#wrapper {
+    width: 100%;
+}
+#box2 {
+    width: 70%;
+    margin: auto;
+    border-left: 2px solid;
+    border-right: 2px solid;
+    border-color: rgba(55,65,81);
+    border-radius: 0.75rem;
+    padding: 0 3rem;
+}
+@media (min-width: 992px) {
 #wrapper {
     width: 80%;
     margin-right: 50px;
 }
-
 #box2 {
     width: 20%;
+    margin: 0;
+    border: 0;
+    padding: 0;
     margin-right: 10px;
+}
 }
 
 
@@ -1079,6 +1114,9 @@ li.L9 {
 
 /* 記事下 */
 
+.entry-footer {
+    text-align: center;
+}
 .entry-footer .social-buttons {
     margin-bottom: 1em;
 }
@@ -1100,6 +1138,11 @@ li.L9 {
     width: 80%;
     margin-left: auto;
     margin-right: auto;
+}
+@media (min-width: 992px) {
+    .comment-box {
+        width: 100%;
+    }
 }
 
 .comment-box .comment {
@@ -1169,8 +1212,8 @@ li.L9 {
     padding: 0.6em 1em;
     font-size: 1.00rem;
     border: 2px solid #c57e80;
-    padding-left: 40%;
-    padding-right: 40%;
+    padding-left: 20%;
+    padding-right: 20%;
     color: #c57e80;
     background-color: #32302f;
     font-weight: bold;
@@ -1189,6 +1232,10 @@ li.L9 {
     justify-content: space-between;
 }
 
+.pager-next, .pager-prev {
+    width: 45%;
+}
+
 
 /* サイドバーモジュール */
 
@@ -1197,6 +1244,24 @@ li.L9 {
     box-sizing: border-box;
     margin-bottom: 3em;
     font-size: 0.85rem;
+    text-align: center;
+}
+.profile-icon {
+    display: none;
+}
+.hatena-follow-button-box {
+    display: none;
+}
+@media (min-width: 992px) {
+    .hatena-module {
+        text-align: left;
+    }
+    .profile-icon {
+        display: block;
+    }
+    .hatena-follow-button-box {
+        display: block;
+    }
 }
 
 @media (min-width: 768px) {
@@ -1435,6 +1500,13 @@ li.L9 {
 
 #footer p {
     margin: 0.5em auto;
+}
+
+/* bottom */
+#bottom-editarea {
+    width: 80%;
+    margin: auto;
+    margin-top: 2em;
 }
 
 
