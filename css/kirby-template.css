@@ -160,7 +160,6 @@ hr {
  */
 
 pre {
-    font-family: monospace, monospace;
     /* 1 */
     font-size: 1em;
     /* 2 */
@@ -611,8 +610,8 @@ a.keyword {
 
 .entry-content code {
     background-color: #404040;
-    color: #c57e80;
-    font-family: "monospace";
+    color: #c94a4e;
+    font-family: "Ubuntu Mono", monospace;
     font-size: 85%;
     padding: 0.2em 0.4em;
     margin: 0;
@@ -1480,7 +1479,6 @@ li.L9 {
     padding-top: 2px;
     padding-left: 7px;
     color: #ebdbb2;
-    font-family: "monospace";
 }
 
 
