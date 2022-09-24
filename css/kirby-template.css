@@ -596,6 +596,7 @@ body {
 a {
     color: #689d6a;
     margin-left: 6px;
+    margin-right: 6px;
     margin-top: 6px;
 }
 
@@ -609,18 +610,64 @@ a.keyword {
     color: #454545;
 }
 
+h3 code, h4 code, h5 code, h6 code {
+    background-color: inherit !important;
+}
+
 .entry-content code {
-    background-color: #404040;
-    color: #c94a4e;
+    background-color: #353131;
+    font-weight: 420%;
+    color: #FE8019;
     font-family: "Ubuntu Mono", monospace;
-    font-size: 85%;
     padding: 0.2em 0.4em;
+    font-weight: bold;
+    font-size: 95%;
     margin: 0;
     margin-left: 6px;
     margin-right: 6px;
     border-radius: 6px;
-    font-size: 85%;
 }
+
+/* Code block (highlight.js) */
+.hljs-ln-numbers {
+    -webkit-touch-callout: none;
+    -webkit-user-select: none;
+    -khtml-user-select: none;
+    -moz-user-select: none;
+    -ms-user-select: none;
+    user-select: none;
+
+    text-align: center;
+    color: #ccc;
+    border: none !important;
+    vertical-align: top;
+    padding-right: 5px;
+}
+
+code.hljs {
+    color: #EBDBB2;
+    font-weight: normal;
+    margin-left: 10px !important;
+    margin-right: 10px !important;
+    border: solid 1px #3a3838 !important;
+    border-radius: 0.75rem;
+    background-color: rgba(19,20,30) !important;
+}
+
+.hljs-ln-code {
+    padding-left: 10px;
+    border: none !important;
+}
+
+.codeblock-title {
+    margin-bottom: 0;
+    padding-bottom: 0;
+    margin-left: 20px;
+    display: inline;
+    font-size: 80%;
+}
+
+/***/
 
 h1,
 h2,
@@ -679,6 +726,7 @@ h4:after {
     border-bottom: dotted 3px #ebdbb2;
     bottom: -3px;
     width: 50%;
+    z-index: 100;
 }
 
 h5 {
