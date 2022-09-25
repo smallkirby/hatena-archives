@@ -6,6 +6,10 @@ kernel exploit / docker escape / poll_list / kROP on tty_struct / tty_file_priva
 
 <div class="contents">[:contents]</div>
 
+////////////////////
+ENGLISH ver is [HERE](https://smallkirby-en.hatenablog.com/entry/corjail)
+////////////////////
+
 # イントロ
 
 いちにょっき、ににょっき、さんにょっき！！こんにちは、ニートです。
